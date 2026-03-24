@@ -7,6 +7,7 @@ wrap_window_delegate! {
     struct VmuxWindowDelegate {
         browser_view: RefCell<Option<BrowserView>>,
         initial_show_state: ShowState,
+        window_slot: Option<usize>,
     }
 
     impl ViewDelegate {
@@ -56,6 +57,27 @@ wrap_window_delegate! {
             self.initial_show_state
         }
 
+        fn initial_bounds(&self, _window: Option<&mut Window>) -> Rect {
+            if let Some(slot) = self.window_slot {
+                let width = 700;
+                let height = 1000;
+                let x = if slot % 2 == 0 { 0 } else { width };
+                return Rect {
+                    x,
+                    y: 0,
+                    width,
+                    height,
+                };
+            }
+
+            Rect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+            }
+        }
+
         fn window_runtime_style(&self) -> RuntimeStyle {
             RuntimeStyle::ALLOY
         }
@@ -81,6 +103,7 @@ wrap_browser_view_delegate! {
             let mut window_delegate = VmuxWindowDelegate::new(
                 RefCell::new(popup_browser_view.cloned()),
                 ShowState::NORMAL,
+                None,
             );
             window_create_top_level(Some(&mut window_delegate));
 
@@ -88,9 +111,9 @@ wrap_browser_view_delegate! {
             1
         }
 
-        // fn browser_runtime_style(&self) -> RuntimeStyle {
-        //     self.runtime_style
-        // }
+        fn browser_runtime_style(&self) -> RuntimeStyle {
+            self.runtime_style
+        }
     }
 }
 
@@ -126,19 +149,11 @@ wrap_browser_process_handler! {
             // Specify CEF browser settings here.
             let settings = BrowserSettings::default();
 
-            // Check if a "--url=" value was provided via the command-line. If so, use
-            // that instead of the default URL.
-            let url = CefString::from(&command_line.switch_value(Some(&CefString::from("url"))))
-                .to_string();
-            let url = if url.is_empty() {
-                "https://www.google.com/"
-            } else {
-                url.as_str()
-            };
-            let url = CefString::from(url);
+            // Always start both windows on Google.
+            let url = CefString::from("https://www.google.com/");
 
             // Views is enabled by default (add `--use-native` to disable).
-            let use_views = command_line.has_switch(Some(&CefString::from("use-native"))) != 0;
+            let use_views = command_line.has_switch(Some(&CefString::from("use-native"))) == 0;
 
             // If using Views create the browser using the Views framework, otherwise
             // create the browser using the native platform framework.
@@ -154,7 +169,6 @@ wrap_browser_process_handler! {
                     None,
                     Some(&mut delegate),
                 );
-
                 // Optionally configure the initial show state.
                 let initial_show_state = CefString::from(
                     &command_line.switch_value(Some(&CefString::from("initial-show-state"))),
@@ -173,8 +187,27 @@ wrap_browser_process_handler! {
                 let mut delegate = VmuxWindowDelegate::new(
                     RefCell::new(browser_view),
                     initial_show_state,
+                    Some(0),
                 );
                 window_create_top_level(Some(&mut delegate));
+
+                // Create a second startup window in the right tile.
+                let mut second_client = self.default_client();
+                let mut second_delegate = VmuxBrowserViewDelegate::new(runtime_style);
+                let second_browser_view = browser_view_create(
+                    second_client.as_mut(),
+                    Some(&url),
+                    Some(&settings),
+                    None,
+                    None,
+                    Some(&mut second_delegate),
+                );
+                let mut second_window_delegate = VmuxWindowDelegate::new(
+                    RefCell::new(second_browser_view),
+                    ShowState::NORMAL,
+                    Some(1),
+                );
+                window_create_top_level(Some(&mut second_window_delegate));
             } else {
                 // Information used when creating the native window.
                 let window_info = WindowInfo {
