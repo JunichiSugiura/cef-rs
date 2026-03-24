@@ -30,7 +30,6 @@ fn platform_show_window(_browser: Option<&mut Browser>) {
 static VMUX_HANDLER_INSTANCE: OnceLock<Weak<Mutex<VmuxHandler>>> = OnceLock::new();
 
 pub struct VmuxHandler {
-    is_alloy_style: bool,
     browser_list: Vec<Browser>,
     is_closing: bool,
     weak_self: Weak<Mutex<Self>>,
@@ -41,14 +40,13 @@ impl VmuxHandler {
         VMUX_HANDLER_INSTANCE.get().and_then(|weak| weak.upgrade())
     }
 
-    pub fn new(is_alloy_style: bool) -> Arc<Mutex<Self>> {
+    pub fn new() -> Arc<Mutex<Self>> {
         Arc::new_cyclic(|weak| {
             if let Err(instance) = VMUX_HANDLER_INSTANCE.set(weak.clone()) {
                 assert_eq!(instance.strong_count(), 0, "Replacing a viable instance");
             }
 
             Mutex::new(Self {
-                is_alloy_style,
                 browser_list: Vec::new(),
                 is_closing: false,
                 weak_self: weak.clone(),
@@ -64,7 +62,7 @@ impl VmuxHandler {
             if let Some(window) = browser_view.window() {
                 window.set_title(title);
             }
-        } else if self.is_alloy_style {
+        } else {
             platform_title_change(browser.as_mut(), title);
         }
     }
@@ -77,11 +75,7 @@ impl VmuxHandler {
         // Sanity-check the configured runtime style.
         assert_eq!(
             browser.host().expect("BrowserHost is None").runtime_style(),
-            if self.is_alloy_style {
-                RuntimeStyle::ALLOY
-            } else {
-                RuntimeStyle::CHROME
-            }
+            RuntimeStyle::ALLOY
         );
 
         // Add to the list of existing browsers.
@@ -133,11 +127,6 @@ impl VmuxHandler {
     ) {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
-        // Allow Chrome to show the error page.
-        if !self.is_alloy_style {
-            return;
-        }
-
         // Don't display an error for downloaded files.
         let error_code = sys::cef_errorcode_t::from(error_code);
         if error_code == sys::cef_errorcode_t::ERR_ABORTED {
@@ -187,7 +176,7 @@ impl VmuxHandler {
             if let Some(window) = browser_view.window() {
                 window.show();
             }
-        } else if self.is_alloy_style {
+        } else {
             platform_show_window(Some(&mut main_browser));
         }
     }

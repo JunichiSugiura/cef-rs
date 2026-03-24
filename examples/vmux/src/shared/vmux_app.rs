@@ -6,7 +6,6 @@ use super::vmux_handler::*;
 wrap_window_delegate! {
     struct VmuxWindowDelegate {
         browser_view: RefCell<Option<BrowserView>>,
-        runtime_style: RuntimeStyle,
         initial_show_state: ShowState,
     }
 
@@ -58,7 +57,7 @@ wrap_window_delegate! {
         }
 
         fn window_runtime_style(&self) -> RuntimeStyle {
-            self.runtime_style
+            RuntimeStyle::ALLOY
         }
     }
 }
@@ -81,7 +80,6 @@ wrap_browser_view_delegate! {
             // creation.
             let mut window_delegate = VmuxWindowDelegate::new(
                 RefCell::new(popup_browser_view.cloned()),
-                self.runtime_style,
                 ShowState::NORMAL,
             );
             window_create_top_level(Some(&mut window_delegate));
@@ -90,9 +88,9 @@ wrap_browser_view_delegate! {
             1
         }
 
-        fn browser_runtime_style(&self) -> RuntimeStyle {
-            self.runtime_style
-        }
+        // fn browser_runtime_style(&self) -> RuntimeStyle {
+        //     self.runtime_style
+        // }
     }
 }
 
@@ -117,20 +115,12 @@ wrap_browser_process_handler! {
 
             // Check if Alloy style will be used.
             let command_line = command_line_get_global().expect("Failed to get command line");
-            let use_alloy_style =
-                command_line.has_switch(Some(&CefString::from("use-alloy-style"))) != 0;
-            let runtime_style = if use_alloy_style {
-                RuntimeStyle::ALLOY
-            } else {
-                RuntimeStyle::DEFAULT
-            };
+            let runtime_style = RuntimeStyle::ALLOY;
 
             {
                 // VmuxHandler implements browser-level callbacks.
                 let mut client = self.client.borrow_mut();
-                *client = Some(VmuxHandlerClient::new(VmuxHandler::new(
-                    use_alloy_style,
-                )));
+                *client = Some(VmuxHandlerClient::new(VmuxHandler::new()));
             }
 
             // Specify CEF browser settings here.
@@ -182,7 +172,6 @@ wrap_browser_process_handler! {
                 // Create the Window. It will show itself after creation.
                 let mut delegate = VmuxWindowDelegate::new(
                     RefCell::new(browser_view),
-                    runtime_style,
                     initial_show_state,
                 );
                 window_create_top_level(Some(&mut delegate));
