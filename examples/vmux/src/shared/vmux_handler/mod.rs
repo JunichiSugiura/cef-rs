@@ -181,22 +181,30 @@ impl VmuxHandler {
         }
     }
 
-    pub fn close_all_browsers(&mut self, force_close: bool) {
+    /// Request close on every tracked browser. Does **not** hold the handler mutex while
+    /// calling `close_browser`: CEF may synchronously invoke `LifeSpanHandler::do_close`,
+    /// which locks the same mutex (deadlock if we kept the lock — e.g. Cmd+Q on macOS).
+    pub fn close_all_browsers(handler: &Arc<Mutex<Self>>, force_close: bool) {
         let thread_id = ThreadId::UI;
         if currently_on(thread_id) == 0 {
-            // Execute on the UI thread.
-            let this = self
-                .weak_self
-                .upgrade()
-                .expect("Weak reference to VmuxHandler is None");
-            let mut task = CloseAllBrowsers::new(this, force_close);
+            let h = handler.clone();
+            let mut task = CloseAllBrowsers::new(h, force_close);
             post_task(thread_id, Some(&mut task));
             return;
         }
 
-        for browser in self.browser_list.iter() {
-            let browser_host = browser.host().expect("BrowserHost is None");
-            browser_host.close_browser(force_close.into());
+        let browsers: Vec<Browser> = {
+            let inner = handler.lock().expect("Failed to lock VmuxHandler");
+            if inner.is_closing {
+                return;
+            }
+            inner.browser_list.clone()
+        };
+
+        for browser in browsers {
+            if let Some(browser_host) = browser.host() {
+                browser_host.close_browser(force_close.into());
+            }
         }
     }
 
@@ -306,8 +314,7 @@ wrap_task! {
         fn execute(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
-            let mut inner = self.inner.lock().expect("Failed to lock inner");
-            inner.close_all_browsers(self.force_close);
+            VmuxHandler::close_all_browsers(&self.inner, self.force_close);
         }
     }
 }

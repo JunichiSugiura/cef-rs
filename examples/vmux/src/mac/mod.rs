@@ -43,9 +43,11 @@ define_class! {
     unsafe impl NSObjectProtocol for VmuxAppDelegate {}
 
     unsafe impl NSApplicationDelegate for VmuxAppDelegate {
+        /// Defer AppKit’s immediate exit: shutdown is driven by closing browsers and
+        /// `quit_message_loop()` once the last `on_before_close` runs.
         #[unsafe(method(applicationShouldTerminate:))]
         unsafe fn application_should_terminate(&self, _sender: &NSApplication) -> NSApplicationTerminateReply {
-            NSApplicationTerminateReply::TerminateNow
+            NSApplicationTerminateReply::TerminateCancel
         }
 
         /// Called when the user clicks the app dock icon while the application is
@@ -163,10 +165,7 @@ define_class!(
         #[unsafe(method(terminate:))]
         unsafe fn terminate(&self, _sender: &AnyObject) {
             if let Some(handler) = VmuxHandler::instance() {
-                let mut handler = handler.lock().expect("Failed to lock VmuxHandler");
-                if !handler.is_closing() {
-                    handler.close_all_browsers(false);
-                }
+                VmuxHandler::close_all_browsers(&handler, false);
             }
         }
     }
