@@ -280,6 +280,10 @@ impl VmuxHandler {
     /// Whether vmux may handle **Shift+H** / **Shift+L** as back/forward.
     ///
     /// Only **`Some(true)`** (probe / IME says editable) blocks interception.
+    ///
+    /// Prefer calling [`Self::refresh_osr_editable_focus_hint_for_history`] first from winit; for
+    /// **j/k/r**-style keys use [`Self::osr_vim_keys_safe_for_page`] instead so unknown hints do not
+    /// steal typing.
     pub fn osr_may_handle_history_shortcuts(browser_id: i32) -> bool {
         let Some(handler) = Self::instance() else {
             return false;
@@ -291,6 +295,23 @@ impl VmuxHandler {
             None | Some(None) | Some(Some(false)) => true,
             Some(Some(true)) => false,
         }
+    }
+
+    /// After [`Self::refresh_osr_editable_focus_hint_for_history`], use this for **vim-style**
+    /// single-key bindings (`j`, `k`, `r`, `g`, …): only **`Some(false)`** means the probe is sure
+    /// focus is **not** in an editable — safe to intercept. **`None` / unknown** does **not** steal
+    /// keys (passes them to the page so typing is not eaten when the hint was stale).
+    pub fn osr_vim_keys_safe_for_page(browser_id: i32) -> bool {
+        let Some(handler) = Self::instance() else {
+            return false;
+        };
+        let Ok(inner) = handler.lock() else {
+            return false;
+        };
+        matches!(
+            inner.osr_editable_focus_hint.get(&browser_id),
+            Some(Some(false))
+        )
     }
 
     pub fn invalidate_osr_editable_focus_hint(browser_id: i32) {
@@ -411,6 +432,67 @@ impl VmuxHandler {
         }
 
         Self::navigate_osr_browser_on_ui(browser_id, go_forward);
+    }
+
+    pub fn reload_osr_browser(browser_id: i32) {
+        let thread_id = ThreadId::UI;
+        if currently_on(thread_id) == 0 {
+            let Some(handler) = Self::instance() else {
+                return;
+            };
+            let done = Arc::new(AtomicBool::new(false));
+            let mut task = ReloadOsrBrowser::new(handler, browser_id, Arc::clone(&done));
+            if post_task(thread_id, Some(&mut task)) == 0 {
+                launch_trace("reload_osr_browser: post_task to UI thread failed");
+                return;
+            }
+            for _ in 0..4096 {
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                do_message_loop_work();
+            }
+            return;
+        }
+
+        Self::reload_osr_browser_on_ui(browser_id);
+    }
+
+    fn reload_osr_browser_on_ui(browser_id: i32) {
+        debug_assert_ne!(currently_on(ThreadId::UI), 0);
+        let Some(handler) = Self::instance() else {
+            return;
+        };
+        let attach = handler.lock().ok().and_then(|h| h.osr_attach.clone());
+        let from_store = attach.as_ref().and_then(|a| {
+            a.windows_store.lock().ok().and_then(|ws| {
+                ws.values()
+                    .find(|e| e.browser.identifier() == browser_id)
+                    .map(|e| e.browser.clone())
+            })
+        });
+        let browser = from_store.or_else(|| {
+            handler.lock().ok().and_then(|inner| {
+                inner
+                    .browser_list
+                    .iter()
+                    .find(|b| b.identifier() == browser_id)
+                    .cloned()
+            })
+        });
+        let Some(browser) = browser else {
+            return;
+        };
+        browser.reload();
+        let bid = browser.identifier();
+        let hub = crate::shared::vmux_osr::bootstrap::hub();
+        hub.reset_paint_redraw_throttle(bid);
+        for _ in 0..24 {
+            do_message_loop_work();
+        }
+        if let Ok(inner) = handler.lock() {
+            inner.request_osr_window_redraw_for_browser(bid);
+        }
     }
 
     pub fn navigate_active(go_forward: bool) {
@@ -1162,6 +1244,23 @@ wrap_task! {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
             let _ = &self.inner;
             VmuxHandler::navigate_osr_browser_on_ui(self.browser_id, self.go_forward);
+            self.done.store(true, Ordering::Release);
+        }
+    }
+}
+
+wrap_task! {
+    struct ReloadOsrBrowser {
+        inner: Arc<Mutex<VmuxHandler>>,
+        browser_id: i32,
+        done: Arc<AtomicBool>,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            debug_assert_ne!(currently_on(ThreadId::UI), 0);
+            let _ = &self.inner;
+            VmuxHandler::reload_osr_browser_on_ui(self.browser_id);
             self.done.store(true, Ordering::Release);
         }
     }

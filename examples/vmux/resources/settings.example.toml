@@ -1,0 +1,20 @@
+# Copy to `settings.toml` in the working directory, next to the app binary, or
+# `~/.config/vmux/settings.toml`. See `shared/settings.rs` for defaults.
+
+[vim]
+enabled = true
+# Milliseconds between two `g` presses for scroll-to-top (`gg`).
+scroll_top_double_press_ms = 500
+
+# Chords: `key`, `shift+j`, `ctrl+k`, `alt+d`, `cmd+l` (physical keys, layout-independent).
+scroll_line_down = "j"
+scroll_line_up = "k"
+scroll_page_down = "d"
+scroll_page_up = "u"
+scroll_top_prefix = "g"
+scroll_bottom = "shift+g"
+history_back = "shift+h"
+history_forward = "shift+l"
+reload = "r"
+
+# Set to "" or "none" to disable a binding.

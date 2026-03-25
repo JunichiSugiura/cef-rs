@@ -27,8 +27,9 @@ wrap_app! {
                 feature = "accelerated_osr",
             ))]
             {
-                // Keeps accelerated OSR in sync with history; avoids constant repaint work from a
-                // FrameHandler on the general browsing path.
+                // Accelerated OSR + BFCache: visible URL/title can update while the IOSurface path
+                // never delivers a matching frame (page “doesn’t change”). Disabling BFCache trades
+                // instant back/forward for a correct texture.
                 command_line.append_switch_with_value(
                     Some(&"disable-features".into()),
                     Some(&"BackForwardCache".into()),

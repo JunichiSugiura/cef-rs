@@ -2,6 +2,7 @@
 
 mod app;
 pub mod color;
+mod vim_scroll;
 pub mod bootstrap;
 pub mod demo_pages;
 pub mod gpu;

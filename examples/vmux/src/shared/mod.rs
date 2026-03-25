@@ -19,6 +19,7 @@ pub fn launch_trace(msg: &str) {
 }
 
 pub mod resources;
+pub mod settings;
 pub mod vmux_app;
 pub mod vmux_handler;
 pub mod vmux_osr;
@@ -150,7 +151,8 @@ pub fn run_main(main_args: &MainArgs, sandbox_info: *mut u8) {
 
     launch_trace("run_main: entering pump loop");
 
-    let mut osr_app = vmux_osr::VmuxOsrApp::new(client_holder, osr_attach);
+    let key_settings = settings::load_settings();
+    let mut osr_app = vmux_osr::VmuxOsrApp::new(client_holder, osr_attach, key_settings);
     loop {
         do_message_loop_work();
         osr_app.pump_macos_shell_refocus();

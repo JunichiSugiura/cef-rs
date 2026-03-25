@@ -28,6 +28,8 @@ wgpu.workspace = true
 winit = { version = "0.30" }
 pollster = "0.4"
 bytemuck = "1"
+serde = { workspace = true, features = ["derive"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

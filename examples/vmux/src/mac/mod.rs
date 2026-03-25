@@ -121,7 +121,7 @@ define_class!(
                 self.set_handling_send_event(true);
             }
 
-            // Back/forward is handled in `vmux_osr` (Shift+H/L; Cmd/Ctrl+[ ]).
+            // Back/forward: `vmux_osr` (`settings.toml` [vim] history keys, default shift+h/l; Cmd/Ctrl+[ ]).
             // Do not handle `NSEventTypeSwipe` here: redundant with scroll and easy to double-fire.
 
             let _: () = msg_send![super(self), sendEvent:event];

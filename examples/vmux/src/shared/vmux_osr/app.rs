@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cef::*;
 use cef::sys::cef_event_flags_t;
@@ -20,11 +21,15 @@ use super::hub::{PendingOsrWindow, VmuxOsrAttach};
 use super::input::{keyboard, mouse};
 use super::{show_all_windows, track_window, titles};
 use crate::shared::launch_trace;
+use crate::shared::settings::{chord_matches, ResolvedVimSettings};
 use crate::shared::vmux_handler::VmuxHandler;
 
 pub struct VmuxOsrApp {
     client_holder: Rc<RefCell<Option<Client>>>,
     osr_attach: VmuxOsrAttach,
+    key_settings: Arc<ResolvedVimSettings>,
+    /// First `g` of `gg` (scroll top) when within `scroll_top_double_press_ms`.
+    vim_g_pending: Option<Instant>,
     started: bool,
     last_cursor_pos: (i32, i32),
     mods: cef_event_flags_t,
@@ -40,10 +45,16 @@ pub struct VmuxOsrApp {
 }
 
 impl VmuxOsrApp {
-    pub fn new(client_holder: Rc<RefCell<Option<Client>>>, osr_attach: VmuxOsrAttach) -> Self {
+    pub fn new(
+        client_holder: Rc<RefCell<Option<Client>>>,
+        osr_attach: VmuxOsrAttach,
+        key_settings: Arc<ResolvedVimSettings>,
+    ) -> Self {
         Self {
             client_holder,
             osr_attach,
+            key_settings,
+            vim_g_pending: None,
             started: false,
             last_cursor_pos: (0, 0),
             mods: cef_event_flags_t::EVENTFLAG_NONE,
@@ -257,6 +268,197 @@ impl VmuxOsrApp {
         launch_trace("spawn_osr_window: queued pending CEF browser");
     }
 
+    fn nudge_after_vim_action(&self, window_id: WindowId) {
+        let Ok(windows) = self.osr_attach.windows_store.lock() else {
+            return;
+        };
+        let Some(entry) = windows.get(&window_id) else {
+            return;
+        };
+        if let Some(h) = entry.browser.host() {
+            h.invalidate(PaintElementType::VIEW);
+            #[cfg(all(
+                any(target_os = "macos", target_os = "windows", target_os = "linux"),
+                feature = "accelerated_osr"
+            ))]
+            h.send_external_begin_frame();
+        }
+        entry.surface.window.request_redraw();
+    }
+
+    fn browser_for_window(&self, window_id: WindowId) -> Option<Browser> {
+        self.osr_attach
+            .windows_store
+            .lock()
+            .ok()
+            .and_then(|w| w.get(&window_id).map(|e| e.browser.clone()))
+    }
+
+    /// Vim-style bindings from `settings.toml` (`[vim]`). Returns `true` if the key was consumed.
+    fn try_handle_vim_keys(&mut self, window_id: WindowId, event: &winit::event::KeyEvent) -> bool {
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+        let km = &*self.key_settings;
+        if !km.enabled {
+            return false;
+        }
+        let Some(bid) = self
+            .osr_attach
+            .windows_store
+            .lock()
+            .ok()
+            .and_then(|w| w.get(&window_id).map(|e| e.browser.identifier()))
+        else {
+            return false;
+        };
+
+        let mods = self.mods;
+        let physical = &event.physical_key;
+
+        let window_ms = km.scroll_top_double_press_ms;
+        let now = Instant::now();
+        if let Some(prev) = self.vim_g_pending {
+            if now.duration_since(prev) > Duration::from_millis(window_ms) {
+                self.vim_g_pending = None;
+            }
+        }
+
+        if let Some(ref chord) = km.history_back {
+            if chord_matches(chord, mods, physical) {
+                VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
+                if VmuxHandler::osr_vim_keys_safe_for_page(bid) {
+                    self.vim_g_pending = None;
+                    VmuxHandler::set_active_browser(bid);
+                    VmuxHandler::navigate_osr_browser(bid, false);
+                    return true;
+                }
+                return false;
+            }
+        }
+        if let Some(ref chord) = km.history_forward {
+            if chord_matches(chord, mods, physical) {
+                VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
+                if VmuxHandler::osr_vim_keys_safe_for_page(bid) {
+                    self.vim_g_pending = None;
+                    VmuxHandler::set_active_browser(bid);
+                    VmuxHandler::navigate_osr_browser(bid, true);
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        let matches_vim_content = [
+            km.scroll_line_down.as_ref(),
+            km.scroll_line_up.as_ref(),
+            km.scroll_page_down.as_ref(),
+            km.scroll_page_up.as_ref(),
+            km.scroll_bottom.as_ref(),
+            km.reload.as_ref(),
+            km.scroll_top_prefix.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|c| chord_matches(c, mods, physical));
+
+        let page_ok = if matches_vim_content {
+            VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
+            VmuxHandler::osr_vim_keys_safe_for_page(bid)
+        } else {
+            false
+        };
+        if let Some(browser) = self.browser_for_window(window_id) {
+            if let Some(ref chord) = km.scroll_line_down {
+                if chord_matches(chord, mods, physical) {
+                    if page_ok {
+                        self.vim_g_pending = None;
+                        super::vim_scroll::scroll_line_down(&browser);
+                        self.nudge_after_vim_action(window_id);
+                    }
+                    return page_ok;
+                }
+            }
+            if let Some(ref chord) = km.scroll_line_up {
+                if chord_matches(chord, mods, physical) {
+                    if page_ok {
+                        self.vim_g_pending = None;
+                        super::vim_scroll::scroll_line_up(&browser);
+                        self.nudge_after_vim_action(window_id);
+                    }
+                    return page_ok;
+                }
+            }
+            if let Some(ref chord) = km.scroll_page_down {
+                if chord_matches(chord, mods, physical) {
+                    if page_ok {
+                        self.vim_g_pending = None;
+                        super::vim_scroll::scroll_page_down(&browser);
+                        self.nudge_after_vim_action(window_id);
+                    }
+                    return page_ok;
+                }
+            }
+            if let Some(ref chord) = km.scroll_page_up {
+                if chord_matches(chord, mods, physical) {
+                    if page_ok {
+                        self.vim_g_pending = None;
+                        super::vim_scroll::scroll_page_up(&browser);
+                        self.nudge_after_vim_action(window_id);
+                    }
+                    return page_ok;
+                }
+            }
+            if let Some(ref chord) = km.scroll_bottom {
+                if chord_matches(chord, mods, physical) {
+                    if page_ok {
+                        self.vim_g_pending = None;
+                        super::vim_scroll::scroll_bottom(&browser);
+                        self.nudge_after_vim_action(window_id);
+                    }
+                    return page_ok;
+                }
+            }
+            if let Some(ref chord) = km.reload {
+                if chord_matches(chord, mods, physical) {
+                    if page_ok {
+                        self.vim_g_pending = None;
+                        VmuxHandler::set_active_browser(bid);
+                        VmuxHandler::reload_osr_browser(bid);
+                    }
+                    return page_ok;
+                }
+            }
+
+            if let Some(ref prefix) = km.scroll_top_prefix {
+                if chord_matches(prefix, mods, physical) {
+                    if !page_ok {
+                        return false;
+                    }
+                    if let Some(prev) = self.vim_g_pending {
+                        if now.duration_since(prev) <= Duration::from_millis(window_ms) {
+                            self.vim_g_pending = None;
+                            super::vim_scroll::scroll_top(&browser);
+                            self.nudge_after_vim_action(window_id);
+                            return true;
+                        }
+                    }
+                    self.vim_g_pending = Some(now);
+                    return true;
+                }
+            }
+        }
+
+        let prefix_matches = km
+            .scroll_top_prefix
+            .as_ref()
+            .is_some_and(|p| chord_matches(p, mods, physical));
+        if !prefix_matches {
+            self.vim_g_pending = None;
+        }
+
+        false
+    }
 }
 
 impl ApplicationHandler for VmuxOsrApp {
@@ -290,48 +492,10 @@ impl ApplicationHandler for VmuxOsrApp {
             self.update_mods_from_winit(m.state());
         }
 
-        // History: **Shift+H** / **Shift+L** (no Cmd/Ctrl/Alt). Plain **h** / **l** must reach the
-        // page — US layout always maps those physical keys to letters, and DOM focus probes are too
-        // often stale/async to safely steal unmodified H/L.
+        // Vim-style bindings (`settings.toml` `[vim]`, defaults like j/k/d/u, shift+h/l, gg, shift+g, r).
         if let WindowEvent::KeyboardInput { event, .. } = &event {
-            if event.state == ElementState::Pressed {
-                let blocked_mods = self.mods.0
-                    & (cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0
-                        | cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0
-                        | cef_event_flags_t::EVENTFLAG_ALT_DOWN.0);
-                let shift = (self.mods.0 & cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0) != 0;
-                if blocked_mods == 0 && shift {
-                    if let PhysicalKey::Code(code) = event.physical_key {
-                        let go_forward = match code {
-                            KeyCode::KeyH => Some(false),
-                            KeyCode::KeyL => Some(true),
-                            _ => None,
-                        };
-                        if let Some(go_forward) = go_forward {
-                            // Clone browser id under a short lock only. `navigate_osr_browser` on the
-                            // UI thread locks `windows_store` again — holding it here deadlocks.
-                            let bid = self
-                                .osr_attach
-                                .windows_store
-                                .lock()
-                                .ok()
-                                .and_then(|w| {
-                                    w.get(&window_id)
-                                        .map(|e| e.browser.identifier())
-                                });
-                            if let Some(bid) = bid {
-                                // `pump_app_events` is not marked as CEF UI thread — refresh via a posted
-                                // task + pump so the hint matches current DOM focus on the page.
-                                VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
-                                if VmuxHandler::osr_may_handle_history_shortcuts(bid) {
-                                    VmuxHandler::set_active_browser(bid);
-                                    VmuxHandler::navigate_osr_browser(bid, go_forward);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
+            if event.state == ElementState::Pressed && self.try_handle_vim_keys(window_id, event) {
+                return;
             }
         }
 
