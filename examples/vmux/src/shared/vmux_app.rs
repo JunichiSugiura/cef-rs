@@ -22,6 +22,18 @@ wrap_app! {
             command_line.append_switch(Some(&"hide-crash-restore-bubble".into()));
             #[cfg(target_os = "macos")]
             command_line.append_switch(Some(&"use-mock-keychain".into()));
+            #[cfg(all(
+                any(target_os = "macos", target_os = "windows", target_os = "linux"),
+                feature = "accelerated_osr",
+            ))]
+            {
+                // Keeps accelerated OSR in sync with history; avoids constant repaint work from a
+                // FrameHandler on the general browsing path.
+                command_line.append_switch_with_value(
+                    Some(&"disable-features".into()),
+                    Some(&"BackForwardCache".into()),
+                );
+            }
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {

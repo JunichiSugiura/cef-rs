@@ -29,35 +29,39 @@ pub struct Geometry {
     pub vertex_count: u32,
 }
 
+fn fullscreen_quad_vertices(offset_x_ndc: f32) -> [Vertex; 4] {
+    let x = -1.0 + offset_x_ndc;
+    let y = 1.0;
+    let width = 2.0;
+    let height = 2.0;
+    let z = 1.0;
+    [
+        Vertex {
+            position: [x, y, z],
+            tex_coords: [0.0, 0.0],
+        },
+        Vertex {
+            position: [x + width, y, z],
+            tex_coords: [1.0, 0.0],
+        },
+        Vertex {
+            position: [x, y - height, z],
+            tex_coords: [0.0, 1.0],
+        },
+        Vertex {
+            position: [x + width, y - height, z],
+            tex_coords: [1.0, 1.0],
+        },
+    ]
+}
+
 impl Geometry {
     pub fn new(device: &wgpu::Device) -> Self {
-        let x = -1.0;
-        let y = 1.0;
-        let width = 2.0;
-        let height = 2.0;
-        let z = 1.0;
-        let vertices = [
-            Vertex {
-                position: [x, y, z],
-                tex_coords: [0.0, 0.0],
-            },
-            Vertex {
-                position: [x + width, y, z],
-                tex_coords: [1.0, 0.0],
-            },
-            Vertex {
-                position: [x, y - height, z],
-                tex_coords: [0.0, 1.0],
-            },
-            Vertex {
-                position: [x + width, y - height, z],
-                tex_coords: [1.0, 1.0],
-            },
-        ];
+        let vertices = fullscreen_quad_vertices(0.0);
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vmux-osr quad"),
             contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         Self {
             vertex_buffer,
@@ -271,6 +275,10 @@ impl WindowSurface {
     }
 
     pub fn render(&mut self, gpu: &SharedGpu, bind_group: Option<&wgpu::BindGroup>) {
+        let vertices = fullscreen_quad_vertices(0.0);
+        gpu.queue
+            .write_buffer(&self.quad.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(_) => return,

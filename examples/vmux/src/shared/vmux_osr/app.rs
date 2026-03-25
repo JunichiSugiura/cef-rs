@@ -7,7 +7,7 @@ use std::sync::Arc;
 use cef::*;
 use cef::sys::cef_event_flags_t;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::ModifiersState;
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -32,6 +32,11 @@ pub struct VmuxOsrApp {
     quit_requested: bool,
     /// Window shells waiting for async `browser_host_create_browser` + `on_after_created`.
     pending_browser_hosts: VecDeque<PendingOsrWindow>,
+    /// macOS: reclaim key window after CEF focuses `<input>` (often happens on the next UI tick).
+    #[cfg(target_os = "macos")]
+    macos_shell_refocus_ticks: u8,
+    #[cfg(target_os = "macos")]
+    macos_shell_refocus_window: Option<WindowId>,
 }
 
 impl VmuxOsrApp {
@@ -45,6 +50,40 @@ impl VmuxOsrApp {
             wheel_residual: (0.0, 0.0),
             quit_requested: false,
             pending_browser_hosts: VecDeque::new(),
+            #[cfg(target_os = "macos")]
+            macos_shell_refocus_ticks: 0,
+            #[cfg(target_os = "macos")]
+            macos_shell_refocus_window: None,
+        }
+    }
+
+    /// Call from the main pump after `do_message_loop_work` and after `pump_app_events`.
+    pub fn pump_macos_shell_refocus(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.macos_shell_refocus_ticks == 0 {
+                return;
+            }
+            let Some(wid) = self.macos_shell_refocus_window else {
+                self.macos_shell_refocus_ticks = 0;
+                return;
+            };
+            if let Ok(windows) = self.osr_attach.windows_store.lock() {
+                if let Some(entry) = windows.get(&wid) {
+                    // Only take key when we don't already have it — avoids hammering AppKit every pump.
+                    if !entry.surface.window.has_focus() {
+                        entry.surface.window.focus_window();
+                    }
+                    // `focus_window` fixes NSApp key window; CEF can still think the browser blurred.
+                    if let Some(host) = entry.browser.host() {
+                        host.set_focus(1);
+                    }
+                }
+            }
+            self.macos_shell_refocus_ticks -= 1;
+            if self.macos_shell_refocus_ticks == 0 {
+                self.macos_shell_refocus_window = None;
+            }
         }
     }
 
@@ -191,6 +230,12 @@ impl VmuxOsrApp {
         let _ = window.set_outer_position(winit::dpi::PhysicalPosition::new(80i32, 80i32));
         window.request_user_attention(None);
         bootstrap::set_device_scale_factor(window.scale_factor() as f32);
+        #[cfg(target_os = "macos")]
+        {
+            // Otherwise winit's NSTextInput path fights windowless CEF for first responder when an
+            // `<input>` is focused, and key focus can jump to another app.
+            window.set_ime_allowed(false);
+        }
 
         launch_trace("spawn_osr_window: WindowSurface::new (wgpu surface)");
         let surface = WindowSurface::new(&*bootstrap::gpu(), window.clone());
@@ -243,6 +288,125 @@ impl ApplicationHandler for VmuxOsrApp {
         // Update modifier flags without holding the windows_store lock.
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.update_mods_from_winit(m.state());
+        }
+
+        // History: **Shift+H** / **Shift+L** (no Cmd/Ctrl/Alt). Plain **h** / **l** must reach the
+        // page — US layout always maps those physical keys to letters, and DOM focus probes are too
+        // often stale/async to safely steal unmodified H/L.
+        if let WindowEvent::KeyboardInput { event, .. } = &event {
+            if event.state == ElementState::Pressed {
+                let blocked_mods = self.mods.0
+                    & (cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0
+                        | cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0
+                        | cef_event_flags_t::EVENTFLAG_ALT_DOWN.0);
+                let shift = (self.mods.0 & cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0) != 0;
+                if blocked_mods == 0 && shift {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        let go_forward = match code {
+                            KeyCode::KeyH => Some(false),
+                            KeyCode::KeyL => Some(true),
+                            _ => None,
+                        };
+                        if let Some(go_forward) = go_forward {
+                            // Clone browser id under a short lock only. `navigate_osr_browser` on the
+                            // UI thread locks `windows_store` again — holding it here deadlocks.
+                            let bid = self
+                                .osr_attach
+                                .windows_store
+                                .lock()
+                                .ok()
+                                .and_then(|w| {
+                                    w.get(&window_id)
+                                        .map(|e| e.browser.identifier())
+                                });
+                            if let Some(bid) = bid {
+                                // `pump_app_events` is not marked as CEF UI thread — refresh via a posted
+                                // task + pump so the hint matches current DOM focus on the page.
+                                VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
+                                if VmuxHandler::osr_may_handle_history_shortcuts(bid) {
+                                    VmuxHandler::set_active_browser(bid);
+                                    VmuxHandler::navigate_osr_browser(bid, go_forward);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // History: **Cmd+[** / **Cmd+]** (macOS) or **Ctrl+[** / **Ctrl+]** (Windows/Linux), same as
+        // Chromium window shortcuts. Unlike Shift+H/L, we do **not** consult the editable-focus hint
+        // so back/forward still run from search fields and other inputs.
+        if let WindowEvent::KeyboardInput { event, .. } = &event {
+            if event.state == ElementState::Pressed {
+                let cmd = (self.mods.0 & cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0) != 0;
+                let ctrl = (self.mods.0 & cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0) != 0;
+                let primary = if cfg!(target_os = "macos") {
+                    cmd
+                } else {
+                    ctrl
+                };
+                if primary {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        let go_forward = match code {
+                            KeyCode::BracketLeft => Some(false),
+                            KeyCode::BracketRight => Some(true),
+                            _ => None,
+                        };
+                        if let Some(go_forward) = go_forward {
+                            let bid = self
+                                .osr_attach
+                                .windows_store
+                                .lock()
+                                .ok()
+                                .and_then(|w| {
+                                    w.get(&window_id)
+                                        .map(|e| e.browser.identifier())
+                                });
+                            if let Some(bid) = bid {
+                                VmuxHandler::set_active_browser(bid);
+                                VmuxHandler::navigate_osr_browser(bid, go_forward);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // **Alt+Left** / **Alt+Right** — typical browser back/forward (esp. Windows); no editable probe.
+        if let WindowEvent::KeyboardInput { event, .. } = &event {
+            if event.state == ElementState::Pressed {
+                let alt = (self.mods.0 & cef_event_flags_t::EVENTFLAG_ALT_DOWN.0) != 0;
+                let cmd = (self.mods.0 & cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0) != 0;
+                let ctrl = (self.mods.0 & cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0) != 0;
+                if alt && !cmd && !ctrl {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        let go_forward = match code {
+                            KeyCode::ArrowLeft => Some(false),
+                            KeyCode::ArrowRight => Some(true),
+                            _ => None,
+                        };
+                        if let Some(go_forward) = go_forward {
+                            let bid = self
+                                .osr_attach
+                                .windows_store
+                                .lock()
+                                .ok()
+                                .and_then(|w| {
+                                    w.get(&window_id)
+                                        .map(|e| e.browser.identifier())
+                                });
+                            if let Some(bid) = bid {
+                                VmuxHandler::set_active_browser(bid);
+                                VmuxHandler::navigate_osr_browser(bid, go_forward);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Global app shortcuts that shouldn't depend on the current browser/window entry.
@@ -371,19 +535,47 @@ impl ApplicationHandler for VmuxOsrApp {
                         }
                     }
                 }
+
+                if event.state == ElementState::Pressed
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
+                {
+                    let bid = entry.browser.identifier();
+                    VmuxHandler::invalidate_osr_editable_focus_hint(bid);
+                    VmuxHandler::schedule_osr_editable_focus_probe(bid);
+                }
             }
             WindowEvent::Ime(ime) => {
                 let Some(entry) = windows.get(&window_id) else {
                     return;
                 };
+                #[cfg(target_os = "macos")]
+                let window = entry.surface.window.clone();
                 let Some(host) = entry.browser.host() else {
                     return;
                 };
                 host.set_focus(1);
+                let bid = entry.browser.identifier();
+                if matches!(ime, winit::event::Ime::Disabled) {
+                    VmuxHandler::invalidate_osr_editable_focus_hint(bid);
+                    VmuxHandler::schedule_osr_editable_focus_probe(bid);
+                } else {
+                    VmuxHandler::set_osr_editable_focus_hint(bid, true);
+                }
                 if let winit::event::Ime::Commit(text) = ime {
                     for ch in text.chars() {
                         keyboard::send_char(&host, self.mods, ch);
                     }
+                }
+                // macOS can hand first responder to IME helpers in another activation context;
+                // keep the winit shell key so typing stays in this window.
+                #[cfg(target_os = "macos")]
+                {
+                    if !window.has_focus() {
+                        window.focus_window();
+                    }
+                    host.set_focus(1);
+                    self.macos_shell_refocus_window = Some(window_id);
+                    self.macos_shell_refocus_ticks = self.macos_shell_refocus_ticks.max(8);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -414,9 +606,30 @@ impl ApplicationHandler for VmuxOsrApp {
                 }
             }
             WindowEvent::Focused(focused) => {
+                #[cfg(target_os = "macos")]
+                if !focused {
+                    // User left this window (or transient IME blur) — stop the pump from calling
+                    // `focus_window` in a loop, which would steal key window back from other apps.
+                    self.macos_shell_refocus_ticks = 0;
+                    self.macos_shell_refocus_window = None;
+                    // Winit/AppKit often emits a transient blur while the shell window is still the
+                    // right target (IME, key-window churn). Telling CEF `set_focus(0)` clears the
+                    // focused `<input>`, caret, and selection — avoid that for windowless OSR.
+                    // Re-assert browser focus only (do not `focus_window` here — that would steal
+                    // activation when the user intentionally switched to another app).
+                    if let Some(entry) = windows.get(&window_id) {
+                        if let Some(host) = entry.browser.host() {
+                            host.set_focus(1);
+                        }
+                    }
+                    return;
+                }
                 if let Some(entry) = windows.get(&window_id) {
                     if let Some(host) = entry.browser.host() {
                         host.set_focus(focused.into());
+                        if focused {
+                            VmuxHandler::set_active_browser(entry.browser.identifier());
+                        }
                     }
                 }
             }
@@ -425,11 +638,32 @@ impl ApplicationHandler for VmuxOsrApp {
                 let Some(entry) = windows.get(&window_id) else {
                     return;
                 };
+                if matches!(state, ElementState::Pressed)
+                    && matches!(button, MouseButton::Back | MouseButton::Forward)
+                {
+                    let go_forward = matches!(button, MouseButton::Forward);
+                    let bid = entry.browser.identifier();
+                    drop(windows);
+                    VmuxHandler::set_active_browser(bid);
+                    VmuxHandler::navigate_osr_browser(bid, go_forward);
+                    return;
+                }
+                let Some(entry) = windows.get(&window_id) else {
+                    return;
+                };
+                #[cfg(target_os = "macos")]
+                let window = entry.surface.window.clone();
                 let Some(host) = entry.browser.host() else {
                     return;
                 };
                 if matches!(state, ElementState::Pressed) {
+                    // Become key *before* CEF sees the click so nested focus logic sees our window.
+                    #[cfg(target_os = "macos")]
+                    if !window.has_focus() {
+                        window.focus_window();
+                    }
                     host.set_focus(1);
+                    VmuxHandler::set_active_browser(entry.browser.identifier());
                 }
                 let cef_button = match button {
                     MouseButton::Left => MouseButtonType::LEFT,
@@ -444,24 +678,38 @@ impl ApplicationHandler for VmuxOsrApp {
                     modifiers: self.mods.0,
                 };
                 host.send_mouse_click_event(Some(&ev), cef_button, mouse_up, 1);
-            }
-            WindowEvent::MouseWheel { delta, phase, .. } => {
-                // Ignore inertial scroll completion; only send active scroll.
-                if matches!(phase, TouchPhase::Cancelled | TouchPhase::Ended) {
-                    return;
+                // Re-hit-test hover/cursor after click so `on_cursor_change` runs (I-beam on inputs).
+                if cef_button == MouseButtonType::LEFT && mouse_up == 1 {
+                    host.send_mouse_move_event(Some(&ev), 0);
+                    let bid = entry.browser.identifier();
+                    VmuxHandler::invalidate_osr_editable_focus_hint(bid);
+                    VmuxHandler::schedule_osr_editable_focus_probe(bid);
                 }
+                // Windowless CEF often has no real NSView for the page; after focusing an `<input>`,
+                // Chromium can resign our shell window’s key status and another app becomes active.
+                // Only arm refocus on press — release would re-steal key after drag-release outside.
+                #[cfg(target_os = "macos")]
+                if matches!(state, ElementState::Pressed) {
+                    if !window.has_focus() {
+                        window.focus_window();
+                    }
+                    self.macos_shell_refocus_window = Some(window_id);
+                    self.macos_shell_refocus_ticks = self.macos_shell_refocus_ticks.max(10);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
                 let Some(entry) = windows.get(&window_id) else {
                     return;
                 };
                 let browser = entry.browser.clone();
-                let scale_factor = entry.surface.window.scale_factor();
                 drop(windows);
+
+                let mods = self.mods;
+                let (dx, dy, mods) = mouse::wheel_to_cef(delta, mods);
+
                 let Some(host) = browser.host() else {
                     return;
                 };
-                let mods = self.mods;
-                let (dx, dy, mods) = mouse::wheel_to_cef(delta, mods);
-                let _ = scale_factor; // maintained for clarity re: winit units
                 let Some((dx_i, dy_i)) = mouse::take_wheel_deltas_i32(&mut self.wheel_residual, dx, dy) else {
                     return;
                 };

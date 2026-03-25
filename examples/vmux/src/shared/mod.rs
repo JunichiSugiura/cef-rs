@@ -153,6 +153,7 @@ pub fn run_main(main_args: &MainArgs, sandbox_info: *mut u8) {
     let mut osr_app = vmux_osr::VmuxOsrApp::new(client_holder, osr_attach);
     loop {
         do_message_loop_work();
+        osr_app.pump_macos_shell_refocus();
         // One pending shell per outer tick: never call `browser_host_create_browser` again until
         // `on_after_created` has popped the matching shell from `shell_fifo` (see `finish_next`).
         // Extra `do_message_loop_work` after each create helps Chromium settle before the next pump.
@@ -171,6 +172,7 @@ pub fn run_main(main_args: &MainArgs, sandbox_info: *mut u8) {
             launch_trace("run_main: PumpStatus::Exit, leaving pump loop");
             break;
         }
+        osr_app.pump_macos_shell_refocus();
         // Higher tick rate improves input/scroll smoothness (trackpads can be 120Hz).
         thread::sleep(Duration::from_millis(1000 / 120));
     }

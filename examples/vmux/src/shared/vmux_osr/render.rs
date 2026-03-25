@@ -1,9 +1,11 @@
 use cef::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
-use super::hub::VmuxOsrHub;
+use super::hub::{VmuxOsrAttach, VmuxOsrHub};
 use super::color;
 
 static PAINT_DEBUG_TICK: AtomicUsize = AtomicUsize::new(0);
@@ -11,10 +13,35 @@ static PAINT_DEBUG_TICK: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone)]
 pub struct VmuxOsrRenderInner {
     pub hub: Arc<VmuxOsrHub>,
+    pub windows_attach: VmuxOsrAttach,
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub layout: Arc<wgpu::BindGroupLayout>,
     pub device_scale_factor: Arc<Mutex<f32>>,
+    /// Throttle `request_redraw` after each paint so we do not spin: begin_frame → paint → redraw.
+    pub paint_redraw_throttle: Arc<Mutex<HashMap<i32, Instant>>>,
+}
+
+impl VmuxOsrRenderInner {
+    /// After a new texture/bind group is uploaded, schedule a winit present.
+    ///
+    /// Always call `request_redraw`: `replace_bind_group` already updated the texture; throttling
+    /// redraws here used to skip `request_redraw` while still swapping bind groups, so the window
+    /// kept presenting stale pixels (common after history navigation + several accelerated paints).
+    fn request_redraw_after_new_texture(&self, browser_id: i32) {
+        if let Ok(mut m) = self.paint_redraw_throttle.lock() {
+            m.insert(browser_id, Instant::now());
+        }
+        let Some(wid) = self.hub.window_id_for_browser(browser_id) else {
+            return;
+        };
+        let Ok(windows) = self.windows_attach.windows_store.lock() else {
+            return;
+        };
+        if let Some(entry) = windows.get(&wid) {
+            entry.surface.window.request_redraw();
+        }
+    }
 }
 
 wrap_render_handler! {
@@ -183,6 +210,7 @@ wrap_render_handler! {
                 ],
             });
             self.inner.hub.replace_bind_group(id, bind_group);
+            self.inner.request_redraw_after_new_texture(id);
         }
 
         fn on_paint(
@@ -326,6 +354,7 @@ wrap_render_handler! {
                 ],
             });
             self.inner.hub.replace_bind_group(id, bind_group);
+            self.inner.request_redraw_after_new_texture(id);
         }
     }
 }

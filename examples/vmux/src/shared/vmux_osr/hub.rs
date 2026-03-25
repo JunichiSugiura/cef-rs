@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use cef::Browser;
 use winit::dpi::LogicalSize;
@@ -51,6 +52,8 @@ pub struct TabPaintSlot {
 pub struct VmuxOsrHub {
     tabs: Mutex<HashMap<i32, TabPaintSlot>>,
     browser_to_window: Mutex<HashMap<i32, WindowId>>,
+    /// Shared with `VmuxOsrRenderInner` — limits `request_redraw` after each OSR paint.
+    paint_redraw_throttle: Arc<Mutex<HashMap<i32, Instant>>>,
 }
 
 impl VmuxOsrHub {
@@ -58,7 +61,22 @@ impl VmuxOsrHub {
         Arc::new(Self {
             tabs: Mutex::new(HashMap::new()),
             browser_to_window: Mutex::new(HashMap::new()),
+            paint_redraw_throttle: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    pub fn paint_redraw_throttle(&self) -> Arc<Mutex<HashMap<i32, Instant>>> {
+        self.paint_redraw_throttle.clone()
+    }
+
+    /// Call after history navigation so the next `on_accelerated_paint` is not throttled away from
+    /// scheduling a winit present (avoids a stuck black view after back/forward).
+    pub fn reset_paint_redraw_throttle(&self, browser_id: i32) {
+        let _ = self
+            .paint_redraw_throttle
+            .lock()
+            .ok()
+            .map(|mut m| m.remove(&browser_id));
     }
 
     pub fn register_browser(
@@ -85,6 +103,7 @@ impl VmuxOsrHub {
     pub fn unregister_browser(&self, browser_id: i32) {
         self.tabs.lock().unwrap().remove(&browser_id);
         self.browser_to_window.lock().unwrap().remove(&browser_id);
+        self.reset_paint_redraw_throttle(browser_id);
     }
 
     pub fn window_id_for_browser(&self, browser_id: i32) -> Option<WindowId> {

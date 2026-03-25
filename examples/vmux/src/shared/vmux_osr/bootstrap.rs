@@ -48,10 +48,12 @@ pub fn init_client_with_osr(
     let dsf = Arc::new(Mutex::new(1.0f32));
     let render_inner = VmuxOsrRenderInner {
         hub: hub.clone(),
+        windows_attach: osr_attach.clone(),
         device: gpu.device.clone(),
         queue: gpu.queue.clone(),
         layout: gpu.texture_bind_group_layout.clone(),
         device_scale_factor: dsf.clone(),
+        paint_redraw_throttle: hub.paint_redraw_throttle(),
     };
     let rh = VmuxOsrRenderHandler::build(render_inner);
     let handler = crate::shared::vmux_handler::VmuxHandler::new(Some(osr_attach));
