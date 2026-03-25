@@ -13,8 +13,9 @@ name = "vmux"
 name = "vmux_helper"
 
 [features]
-default = ["sandbox"]
+default = ["sandbox", "accelerated_osr"]
 sandbox = ["cef/sandbox"]
+accelerated_osr = ["cef/accelerated_osr"]
 linux-x11 = ["x11-dl"]
 
 [package.metadata.cef.bundle]
@@ -23,6 +24,13 @@ resources_path = "resources"
 
 [dependencies]
 cef = { workspace = true, features = ["build-util"] }
+wgpu.workspace = true
+winit = { version = "0.30" }
+pollster = "0.4"
+bytemuck = "1"
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

@@ -1,5 +1,9 @@
 use cef::*;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+use crate::shared::launch_trace;
+use crate::shared::vmux_osr::hub::{VmuxOsrAttach, WindowEntry};
 
 fn get_data_uri(data: &[u8], mime_type: &str) -> String {
     let data = CefString::from(&base64_encode(Some(data)));
@@ -33,6 +37,14 @@ pub struct VmuxHandler {
     browser_list: Vec<Browser>,
     is_closing: bool,
     weak_self: Weak<Mutex<Self>>,
+    /// When set, each `browser_host_create_browser` is paired with a `PendingOsrWindow` in the fifo.
+    osr_attach: Option<VmuxOsrAttach>,
+    /// Windowless OSR: CEF destroys the browser immediately if `do_close` returns **false**. We only
+    /// return false when the user closed the winit window (`arm_windowless_close_from_winit`) or
+    /// during `close_all_browsers` (`bypass_windowless_do_close_guard`). Otherwise return **true**
+    /// to cancel spurious close requests (stops the window flashing away on startup).
+    allow_next_windowless_do_close: bool,
+    bypass_windowless_do_close_guard: bool,
 }
 
 impl VmuxHandler {
@@ -40,7 +52,7 @@ impl VmuxHandler {
         VMUX_HANDLER_INSTANCE.get().and_then(|weak| weak.upgrade())
     }
 
-    pub fn new() -> Arc<Mutex<Self>> {
+    pub fn new(osr_attach: Option<VmuxOsrAttach>) -> Arc<Mutex<Self>> {
         Arc::new_cyclic(|weak| {
             if let Err(instance) = VMUX_HANDLER_INSTANCE.set(weak.clone()) {
                 assert_eq!(instance.strong_count(), 0, "Replacing a viable instance");
@@ -50,27 +62,51 @@ impl VmuxHandler {
                 browser_list: Vec::new(),
                 is_closing: false,
                 weak_self: weak.clone(),
+                osr_attach,
+                allow_next_windowless_do_close: false,
+                bypass_windowless_do_close_guard: false,
             })
         })
+    }
+
+    /// Call from the winit `CloseRequested` path **before** `try_close_browser` so `do_close` can
+    /// return false (allow CEF to destroy this browser) without treating the request as spurious.
+    pub fn arm_windowless_close_from_winit() {
+        let Some(handler) = Self::instance() else {
+            return;
+        };
+        let Ok(mut inner) = handler.lock() else {
+            return;
+        };
+        inner.allow_next_windowless_do_close = true;
     }
 
     fn on_title_change(&mut self, browser: Option<&mut Browser>, title: Option<&CefString>) {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
         let mut browser = browser.cloned();
+        let browser_id = browser.as_ref().map(|b| b.identifier());
         if let Some(browser_view) = browser_view_get_for_browser(browser.as_mut()) {
             if let Some(window) = browser_view.window() {
                 window.set_title(title);
+                return;
             }
-        } else {
-            platform_title_change(browser.as_mut(), title);
         }
+        if let (Some(id), Some(t)) = (browser_id, title) {
+            crate::shared::vmux_osr::titles::push_title(id, t.to_string());
+        }
+        platform_title_change(browser.as_mut(), title);
     }
 
     fn on_after_created(&mut self, browser: Option<&mut Browser>) {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
+        launch_trace("on_after_created: entered (CEF UI thread)");
 
         let browser = browser.cloned().expect("Browser is None");
+        launch_trace(&format!(
+            "on_after_created: browser_id={}",
+            browser.identifier()
+        ));
 
         // Sanity-check the configured runtime style.
         assert_eq!(
@@ -78,24 +114,68 @@ impl VmuxHandler {
             RuntimeStyle::ALLOY
         );
 
-        // Add to the list of existing browsers.
-        self.browser_list.push(browser);
+        if let Some(ref attach) = self.osr_attach {
+            self.browser_list.push(browser.clone());
+            let shell = attach
+                .shell_fifo
+                .lock()
+                .expect("vmux shell_fifo")
+                .pop_front();
+            let Some(shell) = shell else {
+                launch_trace("FATAL: on_after_created: no pending OSR shell (fifo empty)");
+                std::process::exit(1);
+            };
+            let browser_id = browser.identifier();
+            let wid = shell.surface.window.id();
+            let size = crate::shared::vmux_osr::bootstrap::hub().register_browser(
+                browser_id,
+                wid,
+                shell.logical,
+            );
+            let mut ws = attach.windows_store.lock().expect("vmux windows_store");
+            ws.insert(
+                wid,
+                WindowEntry {
+                    surface: shell.surface,
+                    browser,
+                    size,
+                },
+            );
+            if let Some(entry) = ws.get(&wid) {
+                entry.surface.window.request_redraw();
+            }
+            attach.unpaired_osr_shells.fetch_sub(1, Ordering::Release);
+            launch_trace("on_after_created: OSR shell attached to browser");
+        } else {
+            self.browser_list.push(browser);
+        }
     }
 
-    fn do_close(&mut self, _browser: Option<&mut Browser>) -> bool {
+    /// CEF / C++: `false` (0) = proceed with close; for windowless, that destroys the browser
+    /// immediately. `true` (non-zero) = cancel / defer (non-standard owner window).
+    fn do_close(&mut self, _browser: Option<&mut Browser>) -> i32 {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
-        // Closing the main window requires special handling. See the DoClose()
-        // documentation in the CEF header for a detailed destription of this
-        // process.
-        if self.browser_list.len() == 1 {
-            // Set a flag to indicate that the window close should be allowed.
-            self.is_closing = true;
+        if self.osr_attach.is_some() {
+            let allow = self.bypass_windowless_do_close_guard || self.allow_next_windowless_do_close;
+            if self.allow_next_windowless_do_close {
+                self.allow_next_windowless_do_close = false;
+            }
+            if !allow {
+                launch_trace("do_close: OSR cancel (no winit/force arm)");
+                return 1;
+            }
+            if self.browser_list.len() == 1 {
+                self.is_closing = true;
+            }
+            launch_trace("do_close: OSR allow destroy");
+            return 0;
         }
 
-        // Allow the close. For windowed browsers this will result in the OS close
-        // event being sent.
-        false
+        if self.browser_list.len() == 1 {
+            self.is_closing = true;
+        }
+        0
     }
 
     fn on_before_close(&mut self, browser: Option<&mut Browser>) {
@@ -103,6 +183,12 @@ impl VmuxHandler {
 
         // Remove from the list of existing browsers.
         let mut browser = browser.cloned().expect("Browser is None");
+        let removed_id = browser.identifier();
+        let wid_for_removed = if self.osr_attach.is_some() {
+            crate::shared::vmux_osr::bootstrap::hub().window_id_for_browser(removed_id)
+        } else {
+            None
+        };
         if let Some(index) = self
             .browser_list
             .iter()
@@ -110,10 +196,50 @@ impl VmuxHandler {
         {
             self.browser_list.remove(index);
         }
+        crate::shared::vmux_osr::bootstrap::hub().unregister_browser(removed_id);
+
+        if let (Some(attach), Some(wid)) = (self.osr_attach.as_ref(), wid_for_removed) {
+            let removed = attach
+                .windows_store
+                .lock()
+                .expect("vmux windows_store")
+                .remove(&wid);
+            if removed.is_some() {
+                launch_trace(&format!(
+                    "on_before_close: dropped OSR WindowEntry for browser_id={removed_id} (winit window closes with entry)"
+                ));
+            }
+        }
 
         if self.browser_list.is_empty() {
-            // All browser windows have closed. Quit the application message loop.
-            quit_message_loop();
+            if let Some(ref attach) = self.osr_attach {
+                let ws_empty = attach
+                    .windows_store
+                    .lock()
+                    .expect("vmux windows_store")
+                    .is_empty();
+                let fifo_empty = attach
+                    .shell_fifo
+                    .lock()
+                    .expect("vmux shell_fifo")
+                    .is_empty();
+                let unpaired = attach.unpaired_osr_shells.load(Ordering::Acquire);
+                if !ws_empty || !fifo_empty || unpaired > 0 {
+                    launch_trace(&format!(
+                        "on_before_close: skip shutdown (OSR active: store_empty={ws_empty} fifo_empty={fifo_empty} unpaired={unpaired})"
+                    ));
+                    return;
+                }
+            }
+            // All browsers are gone; safe to clear any OSR close bypass.
+            self.bypass_windowless_do_close_guard = false;
+            launch_trace("on_before_close: browser list empty, setting shutdown (no quit_message_loop here)");
+            if let Some(flag) = crate::shared::vmux_osr::shutdown::shutdown_flag() {
+                flag.store(true, Ordering::Release);
+            }
+            // Do not call `quit_message_loop()` here: with AppKit + winit `pump_app_events`, that can
+            // tear down the NS run loop and make the window vanish immediately. We call it once in
+            // `run_main` immediately before `cef::shutdown()`.
         }
     }
 
@@ -177,6 +303,7 @@ impl VmuxHandler {
                 window.show();
             }
         } else {
+            crate::shared::vmux_osr::show_all_windows();
             platform_show_window(Some(&mut main_browser));
         }
     }
@@ -193,17 +320,36 @@ impl VmuxHandler {
             return;
         }
 
-        let browsers: Vec<Browser> = {
-            let inner = handler.lock().expect("Failed to lock VmuxHandler");
+        let (browsers, has_osr): (Vec<Browser>, bool) = {
+            let mut inner = handler.lock().expect("Failed to lock VmuxHandler");
             if inner.is_closing {
                 return;
             }
-            inner.browser_list.clone()
+            let has_osr = inner.osr_attach.is_some();
+            if has_osr {
+                // When quitting (Cmd+Q / terminate:), `close_browser()` may lead to `do_close`
+                // being evaluated slightly later. Keep this bypass enabled until the last browser
+                // is actually closed; otherwise the OSR `do_close` guard can cancel the first quit
+                // attempt, requiring Cmd+Q twice.
+                inner.bypass_windowless_do_close_guard = true;
+                if force_close {
+                    inner.is_closing = true;
+                }
+            }
+            (inner.browser_list.clone(), has_osr)
         };
 
         for browser in browsers {
             if let Some(browser_host) = browser.host() {
                 browser_host.close_browser(force_close.into());
+            }
+        }
+
+        // For OSR we leave `bypass_windowless_do_close_guard` enabled while quitting; it will be
+        // reset when the last browser closes in `on_before_close`.
+        if has_osr && !force_close {
+            if let Ok(mut inner) = handler.lock() {
+                inner.bypass_windowless_do_close_guard = false;
             }
         }
     }
@@ -216,9 +362,14 @@ impl VmuxHandler {
 wrap_client! {
     pub struct VmuxHandlerClient {
         inner: Arc<Mutex<VmuxHandler>>,
+        render: RenderHandler,
     }
 
     impl Client {
+        fn render_handler(&self) -> Option<RenderHandler> {
+            Some(self.render.clone())
+        }
+
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(VmuxHandlerDisplayHandler::new(self.inner.clone()))
         }
@@ -259,7 +410,7 @@ wrap_life_span_handler! {
 
         fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
             let mut inner = self.inner.lock().expect("Failed to lock inner");
-            inner.do_close(browser).into()
+            inner.do_close(browser)
         }
 
         fn on_before_close(&self, browser: Option<&mut Browser>) {

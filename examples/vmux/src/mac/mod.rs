@@ -1,3 +1,5 @@
+//! CEF-required AppKit glue (`VmuxApplication`, Chromium protocols). Winit still owns windows and
+//! the `NSApplicationDelegate` on the OSR pump path; this module does not replace winit windowing.
 use crate::shared::vmux_handler::*;
 use cef::application_mac::{CefAppProtocol, CrAppControlProtocol, CrAppProtocol};
 use objc2::{
@@ -88,6 +90,7 @@ define_class! {
     }
 }
 
+#[allow(dead_code)]
 impl VmuxAppDelegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = VmuxAppDelegate::alloc(mtm).set_ivars(());
@@ -165,7 +168,9 @@ define_class!(
         #[unsafe(method(terminate:))]
         unsafe fn terminate(&self, _sender: &AnyObject) {
             if let Some(handler) = VmuxHandler::instance() {
-                VmuxHandler::close_all_browsers(&handler, false);
+                // Cmd+Q (Quit) should always exit promptly. Treat it as a force-close so we
+                // don't require a second quit attempt if a page delays/blocks close.
+                VmuxHandler::close_all_browsers(&handler, true);
             }
         }
     }
@@ -214,6 +219,9 @@ pub fn setup_vmux_application() {
     );
 }
 
+/// Not used when Winit owns `NSApplicationDelegate` (OSR pump path). Kept for nib/menu wiring once
+/// delegates can be composed with Winit.
+#[allow(dead_code)]
 pub fn setup_vmux_app_delegate() -> Retained<VmuxAppDelegate> {
     let mtm = MainThreadMarker::new().expect("Not running on the main thread");
 
