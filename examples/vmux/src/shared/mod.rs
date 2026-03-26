@@ -115,7 +115,7 @@ pub fn run_main(main_args: &MainArgs, sandbox_info: *mut u8) {
             use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
             // Bundled apps otherwise skip `setActivationPolicy(Regular)`; window may never appear.
             // (Avoid calling `focus_window` during `resumed`—that has crashed AppKit in this setup.)
-            EventLoop::builder()
+            EventLoop::<vmux_osr::event_loop::VmuxUserEvent>::with_user_event()
                 .with_activation_policy(ActivationPolicy::Regular)
                 .with_default_menu(false)
                 .build()
@@ -123,10 +123,14 @@ pub fn run_main(main_args: &MainArgs, sandbox_info: *mut u8) {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            EventLoop::new().expect("vmux: EventLoop::new")
+            EventLoop::<vmux_osr::event_loop::VmuxUserEvent>::with_user_event()
+                .build()
+                .expect("vmux: EventLoop::build")
         }
     };
     event_loop.set_control_flow(ControlFlow::Poll);
+    let wake_proxy = event_loop.create_proxy();
+    vmux_osr::event_loop::init(wake_proxy);
 
     launch_trace("run_main: before cef::initialize");
     assert_eq!(
@@ -152,19 +156,19 @@ pub fn run_main(main_args: &MainArgs, sandbox_info: *mut u8) {
     launch_trace("run_main: entering pump loop");
 
     let key_settings = settings::load_settings();
-    let mut osr_app = vmux_osr::VmuxOsrApp::new(client_holder, osr_attach, key_settings);
+    let mut osr_app =
+        vmux_osr::VmuxOsrApp::new(client_holder, osr_attach, key_settings);
     loop {
-        do_message_loop_work();
+        let post_create_chunk = osr_app.drain_cef_post_create_pumps(8);
+        vmux_osr::cef_pump::main_tick(post_create_chunk);
         osr_app.pump_macos_shell_refocus();
         // One pending shell per outer tick: never call `browser_host_create_browser` again until
         // `on_after_created` has popped the matching shell from `shell_fifo` (see `finish_next`).
-        // Extra `do_message_loop_work` after each create helps Chromium settle before the next pump.
         let issued_create = osr_app.finish_next_pending_browser_if_any();
         if issued_create {
-            for _ in 0..24 {
-                do_message_loop_work();
-            }
+            osr_app.bump_cef_post_create_pumps(24);
         }
+        // Post-create Chromium settle is spread across frames via `cef_post_create_pumps_remaining`.
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             launch_trace("run_main: shutdown flag set, leaving pump loop");
             break;

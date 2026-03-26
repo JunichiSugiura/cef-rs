@@ -29,6 +29,19 @@ pub struct VimSettingsFile {
     pub history_back: String,
     pub history_forward: String,
     pub reload: String,
+    /// Link hints chord (default `f`). While hints are visible, the same key is fed to the page
+    /// (hint letter), not a toggle — use Escape to cancel. Empty / `none` disables.
+    pub hint_links: String,
+    /// Pass keys to the page (Vimium insert). Empty / `none` disables.
+    pub mode_insert: String,
+    /// Open in-page find HUD (`/`). Empty / `none` disables.
+    pub mode_find_open: String,
+    /// Visual mode: `y` copies selection; Esc exits. Empty / `none` disables.
+    pub mode_visual: String,
+    pub find_next: String,
+    pub find_prev: String,
+    /// Copy page URL (clipboard). Empty / `none` disables.
+    pub yank_url: String,
 }
 
 impl Default for VimSettingsFile {
@@ -45,6 +58,13 @@ impl Default for VimSettingsFile {
             history_back: "shift+h".to_string(),
             history_forward: "shift+l".to_string(),
             reload: "r".to_string(),
+            hint_links: "f".to_string(),
+            mode_insert: "i".to_string(),
+            mode_find_open: "/".to_string(),
+            mode_visual: "v".to_string(),
+            find_next: "n".to_string(),
+            find_prev: "shift+n".to_string(),
+            yank_url: "shift+y".to_string(),
         }
     }
 }
@@ -81,6 +101,13 @@ pub struct ResolvedVimSettings {
     pub history_back: Option<KeyChord>,
     pub history_forward: Option<KeyChord>,
     pub reload: Option<KeyChord>,
+    pub hint_links: Option<KeyChord>,
+    pub mode_insert: Option<KeyChord>,
+    pub mode_find_open: Option<KeyChord>,
+    pub mode_visual: Option<KeyChord>,
+    pub find_next: Option<KeyChord>,
+    pub find_prev: Option<KeyChord>,
+    pub yank_url: Option<KeyChord>,
 }
 
 impl ResolvedVimSettings {
@@ -98,6 +125,13 @@ impl ResolvedVimSettings {
             history_back: parse_chord_opt(&v.history_back),
             history_forward: parse_chord_opt(&v.history_forward),
             reload: parse_chord_opt(&v.reload),
+            hint_links: parse_chord_opt(&v.hint_links),
+            mode_insert: parse_chord_opt(&v.mode_insert),
+            mode_find_open: parse_chord_opt(&v.mode_find_open),
+            mode_visual: parse_chord_opt(&v.mode_visual),
+            find_next: parse_chord_opt(&v.find_next),
+            find_prev: parse_chord_opt(&v.find_prev),
+            yank_url: parse_chord_opt(&v.yank_url),
         }
     }
 }
@@ -199,6 +233,7 @@ fn parse_key_code(name: &str) -> Result<KeyCode, String> {
         "end" => KeyCode::End,
         "pageup" => KeyCode::PageUp,
         "pagedown" => KeyCode::PageDown,
+        "slash" | "/" => KeyCode::Slash,
         _ => return Err(format!("unknown key {name:?}")),
     };
     Ok(code)

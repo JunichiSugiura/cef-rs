@@ -9,6 +9,8 @@ scroll_top_double_press_ms = 500
 # Chords: `key`, `shift+j`, `ctrl+k`, `alt+d`, `cmd+l` (physical keys, layout-independent).
 scroll_line_down = "j"
 scroll_line_up = "k"
+# `d` / `g` / `r` match common words (e.g. "ledger"); vmux avoids stealing them once it sees typing,
+# but you can bind to other keys if a site still mis-detects focus.
 scroll_page_down = "d"
 scroll_page_up = "u"
 scroll_top_prefix = "g"
@@ -16,5 +18,21 @@ scroll_bottom = "shift+g"
 history_back = "shift+h"
 history_forward = "shift+l"
 reload = "r"
+# Link hints: up to 26 targets labeled a–z; type one letter. Open with `f` (or your chord).
+# While hints show, that key is used as a hint letter — press Escape to cancel. "" / "none" disables.
+hint_links = "f"
+
+# Vimium-like modes (only when not typing in an editable field — same probe as scroll keys).
+# Insert: pass keys to the page; Esc or Ctrl+[ exits.
+mode_insert = "i"
+# Find: `/` opens a HUD; type to search, Enter accepts, Esc cancels. Then `n` / `shift+n` next/prev.
+mode_find_open = "/"
+find_next = "n"
+find_prev = "shift+n"
+# Visual: banner only; select text with the mouse, `y` copies selection, Esc exits.
+# While the left mouse button is held (e.g. drag-selecting a link), `v` is not captured as visual mode.
+mode_visual = "v"
+# Copy current page URL (clipboard API).
+yank_url = "shift+y"
 
 # Set to "" or "none" to disable a binding.

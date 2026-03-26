@@ -54,6 +54,8 @@ pub struct VmuxOsrHub {
     browser_to_window: Mutex<HashMap<i32, WindowId>>,
     /// Shared with `VmuxOsrRenderInner` — limits `request_redraw` after each OSR paint.
     paint_redraw_throttle: Arc<Mutex<HashMap<i32, Instant>>>,
+    /// Browsers whose document navigated while link hints may have been armed; app clears Rust hint state.
+    link_hints_nav_invalidated: Mutex<Vec<i32>>,
 }
 
 impl VmuxOsrHub {
@@ -62,6 +64,7 @@ impl VmuxOsrHub {
             tabs: Mutex::new(HashMap::new()),
             browser_to_window: Mutex::new(HashMap::new()),
             paint_redraw_throttle: Arc::new(Mutex::new(HashMap::new())),
+            link_hints_nav_invalidated: Mutex::new(Vec::new()),
         })
     }
 
@@ -134,5 +137,17 @@ impl VmuxOsrHub {
         let slot = map.get(&browser_id)?;
         let g = slot.bind_group.lock().ok()?;
         g.as_ref().map(f)
+    }
+
+    pub fn invalidate_link_hints_for_browser(&self, browser_id: i32) {
+        if let Ok(mut v) = self.link_hints_nav_invalidated.lock() {
+            v.push(browser_id);
+        }
+    }
+
+    pub fn take_link_hints_nav_invalidations(&self) -> Vec<i32> {
+        self.link_hints_nav_invalidated
+            .lock()
+            .map_or(Vec::new(), |mut v| std::mem::take(&mut *v))
     }
 }

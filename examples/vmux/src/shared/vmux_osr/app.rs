@@ -15,10 +15,13 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{WindowAttributes, WindowId};
 
 use super::bootstrap;
+use super::event_loop::VmuxUserEvent;
 use super::demo_pages;
 use super::gpu::WindowSurface;
 use super::hub::{PendingOsrWindow, VmuxOsrAttach};
 use super::input::{keyboard, mouse};
+use super::vim_modes::{self};
+use super::vim_state::{OsrVimMachine, VimChromeCleanup};
 use super::{show_all_windows, track_window, titles};
 use crate::shared::launch_trace;
 use crate::shared::settings::{chord_matches, ResolvedVimSettings};
@@ -28,8 +31,10 @@ pub struct VmuxOsrApp {
     client_holder: Rc<RefCell<Option<Client>>>,
     osr_attach: VmuxOsrAttach,
     key_settings: Arc<ResolvedVimSettings>,
-    /// First `g` of `gg` (scroll top) when within `scroll_top_double_press_ms`.
-    vim_g_pending: Option<Instant>,
+    /// Browse / link hints / insert / find / visual — see [`super::vim_state`].
+    vim: OsrVimMachine,
+    /// Left button held (e.g. drag-selecting); avoids stealing `v` for visual mode mid-selection.
+    osr_primary_mouse_down: bool,
     started: bool,
     last_cursor_pos: (i32, i32),
     mods: cef_event_flags_t,
@@ -42,6 +47,9 @@ pub struct VmuxOsrApp {
     macos_shell_refocus_ticks: u8,
     #[cfg(target_os = "macos")]
     macos_shell_refocus_window: Option<WindowId>,
+    /// Spread post-`browser_host_create_browser` Chromium settle work across main-loop cycles
+    /// instead of one tight `do_message_loop_work` burst (see [`super::cef_pump::main_tick`]).
+    cef_post_create_pumps_remaining: u8,
 }
 
 impl VmuxOsrApp {
@@ -54,7 +62,8 @@ impl VmuxOsrApp {
             client_holder,
             osr_attach,
             key_settings,
-            vim_g_pending: None,
+            vim: OsrVimMachine::default(),
+            osr_primary_mouse_down: false,
             started: false,
             last_cursor_pos: (0, 0),
             mods: cef_event_flags_t::EVENTFLAG_NONE,
@@ -65,10 +74,60 @@ impl VmuxOsrApp {
             macos_shell_refocus_ticks: 0,
             #[cfg(target_os = "macos")]
             macos_shell_refocus_window: None,
+            cef_post_create_pumps_remaining: 0,
         }
     }
 
-    /// Call from the main pump after `do_message_loop_work` and after `pump_app_events`.
+    fn defer_vim_key_after_editable_probe(
+        &mut self,
+        window_id: WindowId,
+        browser_id: i32,
+        event: &winit::event::KeyEvent,
+    ) -> bool {
+        VmuxHandler::post_editable_probe_for_vim_replay(browser_id, window_id, event.clone());
+        true
+    }
+
+    fn apply_link_hint_feed_command(
+        &mut self,
+        window_id: WindowId,
+        browser_id: i32,
+        ch: char,
+        outcome_still_active: bool,
+        _hint_label_width: u8,
+    ) {
+        if self.vim.link_hints_browser_id() != Some(browser_id) {
+            return;
+        }
+        if outcome_still_active {
+            self.vim.link_hints_push_typed_char(ch);
+        } else {
+            VmuxHandler::link_hints_hide(browser_id);
+            self.vim.clear_link_hints();
+            VmuxHandler::invalidate_osr_editable_focus_hint(browser_id);
+            VmuxHandler::schedule_osr_editable_focus_probe(browser_id);
+        }
+        self.nudge_after_vim_action(window_id);
+    }
+
+    /// After `finish_next_pending_browser_if_any` returns true, extend the multi-frame settle budget.
+    pub fn bump_cef_post_create_pumps(&mut self, extra: u8) {
+        self.cef_post_create_pumps_remaining = self
+            .cef_post_create_pumps_remaining
+            .saturating_add(extra)
+            .min(64);
+    }
+
+    /// Drain up to `cap_per_frame` toward [`Self::cef_post_create_pumps_remaining`]; used by the main loop.
+    pub fn drain_cef_post_create_pumps(&mut self, cap_per_frame: u8) -> u32 {
+        let take = self
+            .cef_post_create_pumps_remaining
+            .min(cap_per_frame);
+        self.cef_post_create_pumps_remaining -= take;
+        take as u32
+    }
+
+    /// Call from the main pump after the CEF tick and after `pump_app_events`.
     pub fn pump_macos_shell_refocus(&mut self) {
         #[cfg(target_os = "macos")]
         {
@@ -102,7 +161,7 @@ impl VmuxOsrApp {
         self.mods = keyboard::update_mods_from_winit(m);
     }
 
-    /// Call once per main-loop iteration **after** `cef::do_message_loop_work()` and **before**
+    /// Call once per main-loop iteration **after** [`super::cef_pump::main_tick`] and **before**
     /// `pump_app_events`. Uses **async** `browser_host_create_browser` (not sync): the blocking
     /// `browser_host_create_browser_sync` deadlocks with `external_message_pump` + our winit pump
     /// even when deferred by one frame. Helpers spawn only after the browser is actually created.
@@ -268,6 +327,137 @@ impl VmuxOsrApp {
         launch_trace("spawn_osr_window: queued pending CEF browser");
     }
 
+    fn discard_vim_link_hints_for_browser_if_any(&mut self, bid: i32) {
+        self.vim.clear_link_hints_if_browser(bid);
+        let Some(wid) = bootstrap::hub().window_id_for_browser(bid) else {
+            return;
+        };
+        // Always hide on navigation invalidation: Rust may already be `Browse` while the DOM
+        // overlay remains (e.g. missed sync), which breaks a follow-up `f`.
+        VmuxHandler::link_hints_hide(bid);
+        self.nudge_after_vim_action(wid);
+    }
+
+    fn apply_link_hints_navigation_resets(&mut self) {
+        let hub = bootstrap::hub();
+        let ids = hub.take_link_hints_nav_invalidations();
+        for bid in ids {
+            self.discard_vim_link_hints_for_browser_if_any(bid);
+            self.discard_vim_ux_for_browser_if_any(bid);
+        }
+    }
+
+    fn cleanup_vim_ux_ui_at_window(&self, window_id: WindowId) {
+        let Some(b) = self.browser_for_window(window_id) else {
+            return;
+        };
+        match self.vim.chrome_cleanup() {
+            Some(VimChromeCleanup::Find) => {
+                vim_modes::find_ui_hide(&b);
+                vim_modes::cef_stop_finding(&b, true);
+            }
+            Some(VimChromeCleanup::Visual) => vim_modes::visual_hint_hide(&b),
+            None => {}
+        }
+    }
+
+    fn clear_vim_ux_if_other_browser(&mut self, bid: i32) {
+        let Some(old_bid) = self.vim.ux_browser_id() else {
+            return;
+        };
+        if old_bid == bid {
+            return;
+        }
+        self.discard_vim_ux_for_browser_if_any(old_bid);
+    }
+
+    /// End insert / find / visual for this browser without clearing `find_committed` (same-tab mode switch).
+    fn teardown_vim_ux_at_window_keep_committed(&mut self, window_id: WindowId, bid: i32) {
+        if self.vim.ux_browser_id() != Some(bid) {
+            return;
+        }
+        self.cleanup_vim_ux_ui_at_window(window_id);
+        self.vim.exit_ux_to_browse();
+    }
+
+    fn discard_vim_ux_for_browser_if_any(&mut self, bid: i32) {
+        if self.vim.ux_browser_id() != Some(bid) {
+            return;
+        }
+        let Some(wid) = bootstrap::hub().window_id_for_browser(bid) else {
+            self.vim.exit_ux_to_browse();
+            self.vim.find_committed.clear();
+            return;
+        };
+        self.cleanup_vim_ux_ui_at_window(wid);
+        self.vim.exit_ux_to_browse();
+        self.vim.find_committed.clear();
+        self.nudge_after_vim_action(wid);
+    }
+
+    fn handle_find_mode_pressed(
+        &mut self,
+        window_id: WindowId,
+        event: &winit::event::KeyEvent,
+    ) -> bool {
+        use cef::sys::cef_event_flags_t as F;
+        let mods = self.mods;
+        let ctrl = (mods.0 & F::EVENTFLAG_CONTROL_DOWN.0) != 0;
+        let cmd = (mods.0 & F::EVENTFLAG_COMMAND_DOWN.0) != 0;
+        if ctrl || cmd {
+            return false;
+        }
+        let Some(browser) = self.browser_for_window(window_id) else {
+            return true;
+        };
+        let physical = &event.physical_key;
+
+        match physical {
+            PhysicalKey::Code(KeyCode::Escape) => {
+                vim_modes::find_ui_hide(&browser);
+                vim_modes::cef_stop_finding(&browser, true);
+                self.vim.cancel_find();
+                self.nudge_after_vim_action(window_id);
+                return true;
+            }
+            PhysicalKey::Code(KeyCode::Enter) => {
+                vim_modes::find_ui_hide(&browser);
+                self.vim.finish_find_accept();
+                if self.vim.find_committed.is_empty() {
+                    vim_modes::cef_stop_finding(&browser, true);
+                }
+                self.nudge_after_vim_action(window_id);
+                return true;
+            }
+            PhysicalKey::Code(KeyCode::Backspace) => {
+                let Some(query) = self.vim.find_query_mut() else {
+                    return true;
+                };
+                query.pop();
+                vim_modes::find_ui_set_query(&browser, query);
+                vim_modes::cef_find(&browser, query, true, false);
+                self.nudge_after_vim_action(window_id);
+                return true;
+            }
+            _ => {}
+        }
+        let Some(query) = self.vim.find_query_mut() else {
+            return true;
+        };
+        if let Some(t) = &event.text {
+            for ch in t.chars() {
+                if !ch.is_control() {
+                    query.push(ch);
+                }
+            }
+            vim_modes::find_ui_set_query(&browser, query);
+            vim_modes::cef_find(&browser, query, true, false);
+            self.nudge_after_vim_action(window_id);
+            return true;
+        }
+        true
+    }
+
     fn nudge_after_vim_action(&self, window_id: WindowId) {
         let Ok(windows) = self.osr_attach.windows_store.lock() else {
             return;
@@ -296,13 +486,25 @@ impl VmuxOsrApp {
 
     /// Vim-style bindings from `settings.toml` (`[vim]`). Returns `true` if the key was consumed.
     fn try_handle_vim_keys(&mut self, window_id: WindowId, event: &winit::event::KeyEvent) -> bool {
-        if event.state != ElementState::Pressed {
-            return false;
-        }
+        self.try_handle_vim_keys_inner(window_id, event, false)
+    }
+
+    fn try_handle_vim_keys_after_editable_probe(
+        &mut self,
+        window_id: WindowId,
+        event: &winit::event::KeyEvent,
+    ) -> bool {
+        self.try_handle_vim_keys_inner(window_id, event, true)
+    }
+
+    /// `editable_hint_fresh`: editable-focus DOM probe has just run; skip scheduling another probe before branching.
+    fn try_handle_vim_keys_inner(
+        &mut self,
+        window_id: WindowId,
+        event: &winit::event::KeyEvent,
+        editable_hint_fresh: bool,
+    ) -> bool {
         let km = &*self.key_settings;
-        if !km.enabled {
-            return false;
-        }
         let Some(bid) = self
             .osr_attach
             .windows_store
@@ -313,22 +515,208 @@ impl VmuxOsrApp {
             return false;
         };
 
+        if !km.enabled {
+            if self.vim.link_hints_browser_id() == Some(bid) {
+                VmuxHandler::link_hints_hide(bid);
+                self.nudge_after_vim_action(window_id);
+                self.vim.clear_link_hints();
+            }
+            if self.vim.ux_browser_id() == Some(bid) {
+                self.cleanup_vim_ux_ui_at_window(window_id);
+                self.vim.exit_ux_to_browse();
+                self.vim.find_committed.clear();
+            }
+            return false;
+        }
+
+        if self.vim.find_swallows_keyup(bid) {
+            if event.state == ElementState::Released {
+                return true;
+            }
+        }
+
+        if event.state != ElementState::Pressed {
+            return false;
+        }
+
         let mods = self.mods;
         let physical = &event.physical_key;
+        let letter_press_no_winit_text = keyboard::physical_letter_press_without_winit_text(event);
+        let key_sends_printable_text = keyboard::keyevent_has_printable_text(event);
+        let now = Instant::now();
+
+        if let Some(hid_bid) = self.vim.expire_link_hints_if_due(now) {
+            VmuxHandler::link_hints_hide(hid_bid);
+            self.nudge_after_vim_action(window_id);
+        }
+
+        // `LinkHints`: when typing the hint letters themselves we must NOT dismiss based on
+        // "editable focus" probes, otherwise hints can disappear without activating a target.
+        if self.vim.link_hints_active() {
+            use cef::sys::cef_event_flags_t as F;
+            let is_hint_letter = keyboard::lowercase_letter_from_physical(physical).is_some();
+            let esc = match physical {
+                PhysicalKey::Code(KeyCode::Escape) => true,
+                _ => false,
+            };
+            let no_ctrl_alt_cmd = (mods.0
+                & (F::EVENTFLAG_CONTROL_DOWN.0
+                    | F::EVENTFLAG_ALT_DOWN.0
+                    | F::EVENTFLAG_COMMAND_DOWN.0))
+                == 0;
+
+            // Dismiss only for keys other than plain hint letters.
+            if !(is_hint_letter && no_ctrl_alt_cmd) {
+                if !editable_hint_fresh {
+                    return self.defer_vim_key_after_editable_probe(window_id, bid, event);
+                }
+                if !VmuxHandler::osr_may_handle_history_shortcuts(bid) {
+                    VmuxHandler::link_hints_hide(bid);
+                    self.vim.clear_link_hints();
+                    self.nudge_after_vim_action(window_id);
+                }
+            }
+
+            if !self.vim.link_hints_active() {
+                // Dismissed above.
+                return false;
+            }
+
+            if esc && no_ctrl_alt_cmd {
+                VmuxHandler::link_hints_hide(bid);
+                self.vim.clear_link_hints();
+                self.nudge_after_vim_action(window_id);
+                return true;
+            }
+            return false;
+        }
 
         let window_ms = km.scroll_top_double_press_ms;
-        let now = Instant::now();
-        if let Some(prev) = self.vim_g_pending {
+        if let Some(prev) = self.vim.scroll_g_pending {
             if now.duration_since(prev) > Duration::from_millis(window_ms) {
-                self.vim_g_pending = None;
+                self.vim.scroll_g_pending = None;
+            }
+        }
+
+        if self.vim.is_insert(bid) {
+            use cef::sys::cef_event_flags_t as F;
+            let esc = match physical {
+                PhysicalKey::Code(KeyCode::Escape) => true,
+                _ => false,
+            };
+            let no_mod = (mods.0
+                & (F::EVENTFLAG_CONTROL_DOWN.0
+                    | F::EVENTFLAG_COMMAND_DOWN.0
+                    | F::EVENTFLAG_ALT_DOWN.0
+                    | F::EVENTFLAG_SHIFT_DOWN.0))
+                == 0;
+            let ctrl_ob = (mods.0 & F::EVENTFLAG_CONTROL_DOWN.0) != 0
+                && (mods.0 & (F::EVENTFLAG_COMMAND_DOWN.0 | F::EVENTFLAG_ALT_DOWN.0)) == 0
+                && match physical {
+                    PhysicalKey::Code(KeyCode::BracketLeft) => true,
+                    _ => false,
+                };
+            if (esc && no_mod) || ctrl_ob {
+                self.vim.exit_ux_to_browse();
+                return true;
+            }
+            return false;
+        }
+
+        if self.vim.is_find(bid) {
+            return self.handle_find_mode_pressed(window_id, event);
+        }
+
+        if self.vim.is_visual(bid) {
+            use cef::sys::cef_event_flags_t as F;
+            let esc = match physical {
+                PhysicalKey::Code(KeyCode::Escape) => true,
+                _ => false,
+            };
+            let no_mod = (mods.0
+                & (F::EVENTFLAG_CONTROL_DOWN.0
+                    | F::EVENTFLAG_COMMAND_DOWN.0
+                    | F::EVENTFLAG_ALT_DOWN.0
+                    | F::EVENTFLAG_SHIFT_DOWN.0))
+                == 0;
+            if esc && no_mod {
+                if let Some(b) = self.browser_for_window(window_id) {
+                    vim_modes::visual_hint_hide(&b);
+                }
+                self.vim.exit_ux_to_browse();
+                self.nudge_after_vim_action(window_id);
+                return true;
+            }
+            let y_plain = (mods.0
+                & (F::EVENTFLAG_SHIFT_DOWN.0
+                    | F::EVENTFLAG_CONTROL_DOWN.0
+                    | F::EVENTFLAG_COMMAND_DOWN.0
+                    | F::EVENTFLAG_ALT_DOWN.0))
+                == 0;
+            if y_plain {
+                match physical {
+                    PhysicalKey::Code(KeyCode::KeyY) => {
+                        if let Some(b) = self.browser_for_window(window_id) {
+                            vim_modes::yank_selection(&b);
+                            self.nudge_after_vim_action(window_id);
+                        }
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            return false;
+        }
+
+        // Link hints (`f`): before the printable-text bail (winit sets `text` on letter keys).
+        //
+        // - `osr_may_handle_history_shortcuts`: block when probe/IME says **sure** text focus.
+        // - First keydown uses `!editable_hint_fresh` → defer + DOM probe, then replay once.
+        // - After replay, require `osr_vim_keys_safe_for_page` (probe **sure** not in an editable)
+        //   before arming — avoids (a) an infinite defer loop when the hint never becomes
+        //   `Some(false)`, and (b) arming hints while Google's search box has focus but the probe
+        //   still said "page" for a moment. If we're not sure, pass `f` to the page.
+        if let Some(ref chord) = km.hint_links {
+            if chord_matches(chord, mods, physical) {
+                if !VmuxHandler::osr_may_handle_history_shortcuts(bid) {
+                    return false;
+                }
+                if !editable_hint_fresh {
+                    return self.defer_vim_key_after_editable_probe(window_id, bid, event);
+                }
+                if !VmuxHandler::osr_vim_keys_safe_for_page(bid) {
+                    return false;
+                }
+                VmuxHandler::link_hints_show(bid);
+                self.vim.arm_link_hints(bid, now);
+                self.nudge_after_vim_action(window_id);
+                return true;
+            }
+        }
+
+        // Browse: when the hint says focus is in a text control, pass unmodified keys to CEF.
+        // Do **not** use `KeyEvent::text` here — winit sets it for almost every letter (`j`/`k`/…),
+        // which would block all vim scrolling. Printable-text guarding is applied only where needed
+        // (e.g. find-next/prev) and inside `page_ok` via `letter_press_no_winit_text` for IME.
+        {
+            use cef::sys::cef_event_flags_t as F;
+            let plain = (mods.0
+                & (F::EVENTFLAG_CONTROL_DOWN.0
+                    | F::EVENTFLAG_COMMAND_DOWN.0
+                    | F::EVENTFLAG_ALT_DOWN.0))
+                == 0;
+            if plain && VmuxHandler::osr_editable_focus_is_typing(bid) {
+                return false;
             }
         }
 
         if let Some(ref chord) = km.history_back {
             if chord_matches(chord, mods, physical) {
-                VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
+                if !editable_hint_fresh {
+                    return self.defer_vim_key_after_editable_probe(window_id, bid, event);
+                }
                 if VmuxHandler::osr_vim_keys_safe_for_page(bid) {
-                    self.vim_g_pending = None;
+                    self.vim.scroll_g_pending = None;
                     VmuxHandler::set_active_browser(bid);
                     VmuxHandler::navigate_osr_browser(bid, false);
                     return true;
@@ -338,14 +726,114 @@ impl VmuxOsrApp {
         }
         if let Some(ref chord) = km.history_forward {
             if chord_matches(chord, mods, physical) {
-                VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
+                if !editable_hint_fresh {
+                    return self.defer_vim_key_after_editable_probe(window_id, bid, event);
+                }
                 if VmuxHandler::osr_vim_keys_safe_for_page(bid) {
-                    self.vim_g_pending = None;
+                    self.vim.scroll_g_pending = None;
                     VmuxHandler::set_active_browser(bid);
                     VmuxHandler::navigate_osr_browser(bid, true);
                     return true;
                 }
                 return false;
+            }
+        }
+
+        if let Some(browser) = self.browser_for_window(window_id) {
+            if !self.vim.find_committed.is_empty() {
+                if let Some(ref chord) = km.find_next {
+                    if chord_matches(chord, mods, physical) {
+                        if VmuxHandler::osr_editable_focus_is_typing(bid)
+                            || key_sends_printable_text
+                        {
+                            return false;
+                        }
+                        self.vim.scroll_g_pending = None;
+                        vim_modes::cef_find(&browser, &self.vim.find_committed, true, true);
+                        self.nudge_after_vim_action(window_id);
+                        return true;
+                    }
+                }
+                if let Some(ref chord) = km.find_prev {
+                    if chord_matches(chord, mods, physical) {
+                        if VmuxHandler::osr_editable_focus_is_typing(bid)
+                            || key_sends_printable_text
+                        {
+                            return false;
+                        }
+                        self.vim.scroll_g_pending = None;
+                        vim_modes::cef_find(&browser, &self.vim.find_committed, false, true);
+                        self.nudge_after_vim_action(window_id);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Avoid `refresh_osr_editable_focus_hint_for_history` on every key: it runs a DOM visit +
+        // message-loop pump and can crash or corrupt CEF when re-entered while typing in an `<input>`.
+        let might_mode_chord = [
+            km.mode_insert.as_ref(),
+            km.mode_find_open.as_ref(),
+            km.mode_visual.as_ref(),
+            km.yank_url.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|c| chord_matches(c, mods, physical));
+
+        if might_mode_chord {
+            if !editable_hint_fresh {
+                return self.defer_vim_key_after_editable_probe(window_id, bid, event);
+            }
+            // When `text` is missing, the real character may arrive only via `Ime::Commit`; do not
+            // trust a stale "not editable" probe for mode chords (same class of bug as `d`/`g`/`r`).
+            let page_ok_modes = VmuxHandler::osr_vim_keys_safe_for_page(bid)
+                && !letter_press_no_winit_text;
+
+            if let Some(browser) = self.browser_for_window(window_id) {
+                if let Some(ref chord) = km.mode_insert {
+                    if chord_matches(chord, mods, physical) && page_ok_modes {
+                        self.clear_vim_ux_if_other_browser(bid);
+                        self.teardown_vim_ux_at_window_keep_committed(window_id, bid);
+                        self.vim.enter_insert(bid);
+                        self.nudge_after_vim_action(window_id);
+                        return true;
+                    }
+                }
+                if let Some(ref chord) = km.mode_find_open {
+                    if chord_matches(chord, mods, physical) && page_ok_modes {
+                        self.clear_vim_ux_if_other_browser(bid);
+                        self.teardown_vim_ux_at_window_keep_committed(window_id, bid);
+                        self.vim.enter_find(bid);
+                        vim_modes::find_ui_show(&browser);
+                        vim_modes::find_ui_set_query(&browser, "");
+                        self.nudge_after_vim_action(window_id);
+                        return true;
+                    }
+                }
+                if let Some(ref chord) = km.mode_visual {
+                    if chord_matches(chord, mods, physical)
+                        && page_ok_modes
+                        && !self.osr_primary_mouse_down
+                        && !self.vim.link_hints_active()
+                    {
+                        self.clear_vim_ux_if_other_browser(bid);
+                        self.teardown_vim_ux_at_window_keep_committed(window_id, bid);
+                        self.vim.enter_visual(bid);
+                        vim_modes::visual_hint_show(&browser);
+                        self.nudge_after_vim_action(window_id);
+                        return true;
+                    }
+                }
+                if let Some(ref chord) = km.yank_url {
+                    if chord_matches(chord, mods, physical) && page_ok_modes {
+                        self.vim.scroll_g_pending = None;
+                        vim_modes::yank_page_url(&browser);
+                        self.nudge_after_vim_action(window_id);
+                        return true;
+                    }
+                }
             }
         }
 
@@ -363,8 +851,10 @@ impl VmuxOsrApp {
         .any(|c| chord_matches(c, mods, physical));
 
         let page_ok = if matches_vim_content {
-            VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
-            VmuxHandler::osr_vim_keys_safe_for_page(bid)
+            if !editable_hint_fresh {
+                return self.defer_vim_key_after_editable_probe(window_id, bid, event);
+            }
+            VmuxHandler::osr_vim_keys_safe_for_page(bid) && !letter_press_no_winit_text
         } else {
             false
         };
@@ -372,7 +862,7 @@ impl VmuxOsrApp {
             if let Some(ref chord) = km.scroll_line_down {
                 if chord_matches(chord, mods, physical) {
                     if page_ok {
-                        self.vim_g_pending = None;
+                        self.vim.scroll_g_pending = None;
                         super::vim_scroll::scroll_line_down(&browser);
                         self.nudge_after_vim_action(window_id);
                     }
@@ -382,7 +872,7 @@ impl VmuxOsrApp {
             if let Some(ref chord) = km.scroll_line_up {
                 if chord_matches(chord, mods, physical) {
                     if page_ok {
-                        self.vim_g_pending = None;
+                        self.vim.scroll_g_pending = None;
                         super::vim_scroll::scroll_line_up(&browser);
                         self.nudge_after_vim_action(window_id);
                     }
@@ -392,7 +882,7 @@ impl VmuxOsrApp {
             if let Some(ref chord) = km.scroll_page_down {
                 if chord_matches(chord, mods, physical) {
                     if page_ok {
-                        self.vim_g_pending = None;
+                        self.vim.scroll_g_pending = None;
                         super::vim_scroll::scroll_page_down(&browser);
                         self.nudge_after_vim_action(window_id);
                     }
@@ -402,7 +892,7 @@ impl VmuxOsrApp {
             if let Some(ref chord) = km.scroll_page_up {
                 if chord_matches(chord, mods, physical) {
                     if page_ok {
-                        self.vim_g_pending = None;
+                        self.vim.scroll_g_pending = None;
                         super::vim_scroll::scroll_page_up(&browser);
                         self.nudge_after_vim_action(window_id);
                     }
@@ -412,7 +902,7 @@ impl VmuxOsrApp {
             if let Some(ref chord) = km.scroll_bottom {
                 if chord_matches(chord, mods, physical) {
                     if page_ok {
-                        self.vim_g_pending = None;
+                        self.vim.scroll_g_pending = None;
                         super::vim_scroll::scroll_bottom(&browser);
                         self.nudge_after_vim_action(window_id);
                     }
@@ -422,7 +912,7 @@ impl VmuxOsrApp {
             if let Some(ref chord) = km.reload {
                 if chord_matches(chord, mods, physical) {
                     if page_ok {
-                        self.vim_g_pending = None;
+                        self.vim.scroll_g_pending = None;
                         VmuxHandler::set_active_browser(bid);
                         VmuxHandler::reload_osr_browser(bid);
                     }
@@ -435,15 +925,15 @@ impl VmuxOsrApp {
                     if !page_ok {
                         return false;
                     }
-                    if let Some(prev) = self.vim_g_pending {
+                    if let Some(prev) = self.vim.scroll_g_pending {
                         if now.duration_since(prev) <= Duration::from_millis(window_ms) {
-                            self.vim_g_pending = None;
+                            self.vim.scroll_g_pending = None;
                             super::vim_scroll::scroll_top(&browser);
                             self.nudge_after_vim_action(window_id);
                             return true;
                         }
                     }
-                    self.vim_g_pending = Some(now);
+                    self.vim.scroll_g_pending = Some(now);
                     return true;
                 }
             }
@@ -454,14 +944,36 @@ impl VmuxOsrApp {
             .as_ref()
             .is_some_and(|p| chord_matches(p, mods, physical));
         if !prefix_matches {
-            self.vim_g_pending = None;
+            self.vim.scroll_g_pending = None;
         }
 
         false
     }
 }
 
-impl ApplicationHandler for VmuxOsrApp {
+impl ApplicationHandler<VmuxUserEvent> for VmuxOsrApp {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: VmuxUserEvent) {
+        match event {
+            VmuxUserEvent::VimKeyReplay { window_id, event } => {
+                let _ = self.try_handle_vim_keys_after_editable_probe(window_id, &event);
+            }
+            VmuxUserEvent::LinkHintFeed {
+                window_id,
+                browser_id,
+                ch,
+                still_active,
+                hint_label_width,
+                ..
+            } => self.apply_link_hint_feed_command(
+                window_id,
+                browser_id,
+                ch,
+                still_active,
+                hint_label_width,
+            ),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.started {
             return;
@@ -486,6 +998,7 @@ impl ApplicationHandler for VmuxOsrApp {
         event: WindowEvent,
     ) {
         self.apply_pending_titles();
+        self.apply_link_hints_navigation_resets();
 
         // Update modifier flags without holding the windows_store lock.
         if let WindowEvent::ModifiersChanged(m) = &event {
@@ -493,8 +1006,9 @@ impl ApplicationHandler for VmuxOsrApp {
         }
 
         // Vim-style bindings (`settings.toml` `[vim]`, defaults like j/k/d/u, shift+h/l, gg, shift+g, r).
+        // Find mode swallows key-up here so CEF does not get unmatched KEYUP.
         if let WindowEvent::KeyboardInput { event, .. } = &event {
-            if event.state == ElementState::Pressed && self.try_handle_vim_keys(window_id, event) {
+            if self.try_handle_vim_keys(window_id, event) {
                 return;
             }
         }
@@ -576,17 +1090,21 @@ impl ApplicationHandler for VmuxOsrApp {
         // Global app shortcuts that shouldn't depend on the current browser/window entry.
         if let WindowEvent::KeyboardInput { event: key, .. } = &event {
             let cmd = (self.mods.0 & cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0) != 0;
-            if cmd
-                && key.state == ElementState::Pressed
-                && matches!(key.physical_key, PhysicalKey::Code(KeyCode::KeyQ))
-            {
-                // Quit: force-close all browsers. The normal shutdown path is driven by
-                // `on_before_close` setting the shutdown flag once the last browser closes.
-                self.quit_requested = true;
-                if let Some(handler) = crate::shared::vmux_handler::VmuxHandler::instance() {
-                    crate::shared::vmux_handler::VmuxHandler::close_all_browsers(&handler, true);
+            if cmd && key.state == ElementState::Pressed {
+                match key.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyQ) => {
+                        // Quit: force-close all browsers. The normal shutdown path is driven by
+                        // `on_before_close` setting the shutdown flag once the last browser closes.
+                        self.quit_requested = true;
+                        if let Some(handler) = crate::shared::vmux_handler::VmuxHandler::instance() {
+                            crate::shared::vmux_handler::VmuxHandler::close_all_browsers(
+                                &handler, true,
+                            );
+                        }
+                        return;
+                    }
+                    _ => {}
                 }
-                return;
             }
         }
 
@@ -599,18 +1117,77 @@ impl ApplicationHandler for VmuxOsrApp {
                 let Some(entry) = windows.get(&window_id) else {
                     return;
                 };
+                let browser = entry.browser.clone();
+                let bid = browser.identifier();
+                let ctrl = (self.mods.0 & cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0) != 0;
+                let cmd = (self.mods.0 & cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0) != 0;
+                let alt = (self.mods.0 & cef_event_flags_t::EVENTFLAG_ALT_DOWN.0) != 0;
+                let _shift = (self.mods.0 & cef_event_flags_t::EVENTFLAG_SHIFT_DOWN.0) != 0;
+
+                // Drop the store before CEF / follow-ups: `request_redraw_after_new_texture` may
+                // touch the compositor and re-lock `windows_store`. Same pattern as `MouseWheel`.
+                drop(windows);
+
+                if let Some(h) = browser.host() {
+                    h.set_focus(1);
+                }
+
+                let hint_ch = keyboard::lowercase_letter_from_physical(&event.physical_key);
+
+                // While `LinkHints` is armed, do **not** run editable-focus dismiss from here.
+                // Google (and similar) often keeps a search `<input>` in the tree; probing after
+                // `do_message_loop_work` can flip to "editable" mid-hint-sequence, clear Rust hint
+                // mode, and the **next** letter is delivered to CEF — so you "suddenly type in the
+                // search box" after a few hint keys. Dismiss hints via Esc (`try_handle_vim_keys`)
+                // or when the feed reports hints ended / JS cleans up.
+                // Hint letters are routed only while Rust `LinkHints` mode is active (armed by `f`).
+                // Feeding runs on the CEF UI thread; completion is posted as [`super::event_loop::VmuxUserEvent::LinkHintFeed`].
+                if self.vim.link_hints_active() {
+                    if let Some(ch) = hint_ch {
+                        if !ctrl && !cmd && !alt {
+                            match event.state {
+                                ElementState::Pressed => {
+                                    // OS key-repeat would append the same letter twice (e.g. "bb"
+                                    // for hint "bd") → JS had no matches and called cleanup → Rust
+                                    // cleared LinkHints while badges remained; swallow repeats only.
+                                    if event.repeat {
+                                        return;
+                                    }
+                                    // If focus moved into a real editable, don't swallow the
+                                    // keystroke for hint feeding; instead dismiss hints and
+                                    // let CEF handle typing.
+                                    // When hints are armed, every plain hint-letter is a command
+                                    // for the hint state machine; don't dismiss mid-sequence.
+                                    let prior = self.vim.link_hints_typed_prefix().len();
+                                    VmuxHandler::link_hints_feed_key_deferred(bid, ch, prior);
+                                    return;
+                                }
+                                ElementState::Released => {
+                                    // Keep swallowing releases for hint letters so the page
+                                    // doesn't receive partial hint keystrokes.
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let Ok(windows) = self.osr_attach.windows_store.lock() else {
+                    return;
+                };
+                let Some(entry) = windows.get(&window_id) else {
+                    return;
+                };
                 let Some(host) = entry.browser.host() else {
                     return;
                 };
 
-                host.set_focus(1);
+                let hints_active = self.vim.link_hints_active();
 
                 // Emacs-style Ctrl bindings for text fields (plus Cmd+A select-all).
                 // We implement these at the OSR layer because web pages don't always get native
                 // Cocoa text-system bindings when driven via synthetic key events.
-                let ctrl = (self.mods.0 & cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0) != 0;
-                let cmd = (self.mods.0 & cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0) != 0;
-                if event.state == ElementState::Pressed {
+                if !hints_active && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         // Cmd+A => Select All
                         if cmd && code == KeyCode::KeyA {
@@ -691,21 +1268,32 @@ impl ApplicationHandler for VmuxOsrApp {
                         & (cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0
                             | cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0))
                         != 0;
-                    if !has_shortcut_mod {
+                    if !hints_active && !has_shortcut_mod {
                         if let Some(text) = &event.text {
-                        for ch in text.chars() {
-                            keyboard::send_char(&host, self.mods, ch);
-                        }
+                            let mut any = false;
+                            for ch in text.chars() {
+                                keyboard::send_char(&host, self.mods, ch);
+                                any = true;
+                            }
+                            // Sites like Ledger use search UIs that our DOM probe often misses; once
+                            // printable text is injected, treat focus as typing so `d`/`g`/`r` vim
+                            // bindings do not eat the rest of the word (e.g. "ledger" → "lee").
+                            if any {
+                                VmuxHandler::set_osr_editable_focus_hint(bid, true);
+                            }
                         }
                     }
                 }
 
-                if event.state == ElementState::Pressed
-                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
-                {
-                    let bid = entry.browser.identifier();
-                    VmuxHandler::invalidate_osr_editable_focus_hint(bid);
-                    VmuxHandler::schedule_osr_editable_focus_probe(bid);
+                if event.state == ElementState::Pressed && !hints_active {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Tab) => {
+                            let bid = entry.browser.identifier();
+                            VmuxHandler::invalidate_osr_editable_focus_hint(bid);
+                            VmuxHandler::schedule_osr_editable_focus_probe(bid);
+                        }
+                        _ => {}
+                    }
                 }
             }
             WindowEvent::Ime(ime) => {
@@ -719,11 +1307,26 @@ impl ApplicationHandler for VmuxOsrApp {
                 };
                 host.set_focus(1);
                 let bid = entry.browser.identifier();
-                if matches!(ime, winit::event::Ime::Disabled) {
-                    VmuxHandler::invalidate_osr_editable_focus_hint(bid);
-                    VmuxHandler::schedule_osr_editable_focus_probe(bid);
-                } else {
-                    VmuxHandler::set_osr_editable_focus_hint(bid, true);
+                // `KeyboardInput` for hint letters is swallowed, but macOS still emits `Ime::Commit`
+                // for the same physical key; forwarding it would inject into the page (e.g. second
+                // letter of hint "by") and sites like Ledger show "press / for search" when focus
+                // churns.
+                match &ime {
+                    winit::event::Ime::Commit(_) => {
+                        if self.vim.link_hints_active()
+                            && self.vim.link_hints_browser_id() == Some(bid)
+                        {
+                            return;
+                        }
+                        VmuxHandler::set_osr_editable_focus_hint(bid, true);
+                    }
+                    winit::event::Ime::Disabled => {
+                        VmuxHandler::invalidate_osr_editable_focus_hint(bid);
+                        VmuxHandler::schedule_osr_editable_focus_probe(bid);
+                    }
+                    _ => {
+                        VmuxHandler::set_osr_editable_focus_hint(bid, true);
+                    }
                 }
                 if let winit::event::Ime::Commit(text) = ime {
                     for ch in text.chars() {
@@ -758,6 +1361,7 @@ impl ApplicationHandler for VmuxOsrApp {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                self.osr_primary_mouse_down = false;
                 if let Some(entry) = windows.get(&window_id) {
                     if let Some(host) = entry.browser.host() {
                         let ev = MouseEvent {
@@ -770,6 +1374,9 @@ impl ApplicationHandler for VmuxOsrApp {
                 }
             }
             WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.osr_primary_mouse_down = false;
+                }
                 #[cfg(target_os = "macos")]
                 if !focused {
                     // User left this window (or transient IME blur) — stop the pump from calling
@@ -802,15 +1409,22 @@ impl ApplicationHandler for VmuxOsrApp {
                 let Some(entry) = windows.get(&window_id) else {
                     return;
                 };
-                if matches!(state, ElementState::Pressed)
-                    && matches!(button, MouseButton::Back | MouseButton::Forward)
-                {
-                    let go_forward = matches!(button, MouseButton::Forward);
-                    let bid = entry.browser.identifier();
-                    drop(windows);
-                    VmuxHandler::set_active_browser(bid);
-                    VmuxHandler::navigate_osr_browser(bid, go_forward);
-                    return;
+                match (state, button) {
+                    (ElementState::Pressed, MouseButton::Back) => {
+                        let bid = entry.browser.identifier();
+                        drop(windows);
+                        VmuxHandler::set_active_browser(bid);
+                        VmuxHandler::navigate_osr_browser(bid, false);
+                        return;
+                    }
+                    (ElementState::Pressed, MouseButton::Forward) => {
+                        let bid = entry.browser.identifier();
+                        drop(windows);
+                        VmuxHandler::set_active_browser(bid);
+                        VmuxHandler::navigate_osr_browser(bid, true);
+                        return;
+                    }
+                    _ => {}
                 }
                 let Some(entry) = windows.get(&window_id) else {
                     return;
@@ -820,14 +1434,17 @@ impl ApplicationHandler for VmuxOsrApp {
                 let Some(host) = entry.browser.host() else {
                     return;
                 };
-                if matches!(state, ElementState::Pressed) {
-                    // Become key *before* CEF sees the click so nested focus logic sees our window.
-                    #[cfg(target_os = "macos")]
-                    if !window.has_focus() {
-                        window.focus_window();
+                match state {
+                    ElementState::Pressed => {
+                        // Become key *before* CEF sees the click so nested focus logic sees our window.
+                        #[cfg(target_os = "macos")]
+                        if !window.has_focus() {
+                            window.focus_window();
+                        }
+                        host.set_focus(1);
+                        VmuxHandler::set_active_browser(entry.browser.identifier());
                     }
-                    host.set_focus(1);
-                    VmuxHandler::set_active_browser(entry.browser.identifier());
+                    ElementState::Released => {}
                 }
                 let cef_button = match button {
                     MouseButton::Left => MouseButtonType::LEFT,
@@ -835,7 +1452,19 @@ impl ApplicationHandler for VmuxOsrApp {
                     MouseButton::Middle => MouseButtonType::MIDDLE,
                     _ => return,
                 };
-                let mouse_up = matches!(state, ElementState::Released) as i32;
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => {
+                        self.osr_primary_mouse_down = true;
+                    }
+                    (MouseButton::Left, ElementState::Released) => {
+                        self.osr_primary_mouse_down = false;
+                    }
+                    _ => {}
+                }
+                let mouse_up = match state {
+                    ElementState::Released => 1,
+                    _ => 0,
+                };
                 let ev = MouseEvent {
                     x: self.last_cursor_pos.0,
                     y: self.last_cursor_pos.1,
@@ -846,19 +1475,26 @@ impl ApplicationHandler for VmuxOsrApp {
                 if cef_button == MouseButtonType::LEFT && mouse_up == 1 {
                     host.send_mouse_move_event(Some(&ev), 0);
                     let bid = entry.browser.identifier();
+                    drop(windows);
                     VmuxHandler::invalidate_osr_editable_focus_hint(bid);
-                    VmuxHandler::schedule_osr_editable_focus_probe(bid);
+                    // Async probe alone can finish after the first keystroke, so `d`/`g`/`r` vim
+                    // bindings still run with a stale "not editable" hint — sync refresh before typing.
+                    VmuxHandler::refresh_osr_editable_focus_hint_for_history(bid);
+                    return;
                 }
                 // Windowless CEF often has no real NSView for the page; after focusing an `<input>`,
                 // Chromium can resign our shell window’s key status and another app becomes active.
                 // Only arm refocus on press — release would re-steal key after drag-release outside.
                 #[cfg(target_os = "macos")]
-                if matches!(state, ElementState::Pressed) {
-                    if !window.has_focus() {
-                        window.focus_window();
+                match state {
+                    ElementState::Pressed => {
+                        if !window.has_focus() {
+                            window.focus_window();
+                        }
+                        self.macos_shell_refocus_window = Some(window_id);
+                        self.macos_shell_refocus_ticks = self.macos_shell_refocus_ticks.max(10);
                     }
-                    self.macos_shell_refocus_window = Some(window_id);
-                    self.macos_shell_refocus_ticks = self.macos_shell_refocus_ticks.max(10);
+                    ElementState::Released => {}
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {

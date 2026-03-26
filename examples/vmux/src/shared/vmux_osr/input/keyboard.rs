@@ -133,8 +133,72 @@ pub fn send_key_press_and_release(host: &BrowserHost, mods: cef_event_flags_t, v
     send_key(host, KeyEventType::KEYUP, mods, vk, native, ch);
 }
 
+/// Letter key down with empty / missing [`winit::event::KeyEvent::text`].
+///
+/// macOS + web content often deliver printable characters only through [`winit::event::Ime`] after
+/// this event. If we still treat the page as vim-safe because the DOM probe missed the field, we
+/// consume `d` / `g` / `r` as bindings while the user is typing (e.g. "ledger" → "lee").
+pub fn physical_letter_press_without_winit_text(event: &winit::event::KeyEvent) -> bool {
+    event.state == ElementState::Pressed
+        && lowercase_letter_from_physical(&event.physical_key).is_some()
+        && !event
+            .text
+            .as_ref()
+            .is_some_and(|t| !t.is_empty())
+}
+
+/// KeyDown delivered a non-control character (user is typing into the page, not a bare shortcut).
+pub fn keyevent_has_printable_text(event: &winit::event::KeyEvent) -> bool {
+    event.state == ElementState::Pressed
+        && event
+            .text
+            .as_ref()
+            .is_some_and(|t| t.chars().any(|c| !c.is_control()))
+}
+
+/// Physical letter key → lowercase ASCII (layout-independent), for link-hint feeding.
+pub fn lowercase_letter_from_physical(physical: &PhysicalKey) -> Option<char> {
+    let PhysicalKey::Code(code) = physical else {
+        return None;
+    };
+    match code {
+        KeyCode::KeyA => Some('a'),
+        KeyCode::KeyB => Some('b'),
+        KeyCode::KeyC => Some('c'),
+        KeyCode::KeyD => Some('d'),
+        KeyCode::KeyE => Some('e'),
+        KeyCode::KeyF => Some('f'),
+        KeyCode::KeyG => Some('g'),
+        KeyCode::KeyH => Some('h'),
+        KeyCode::KeyI => Some('i'),
+        KeyCode::KeyJ => Some('j'),
+        KeyCode::KeyK => Some('k'),
+        KeyCode::KeyL => Some('l'),
+        KeyCode::KeyM => Some('m'),
+        KeyCode::KeyN => Some('n'),
+        KeyCode::KeyO => Some('o'),
+        KeyCode::KeyP => Some('p'),
+        KeyCode::KeyQ => Some('q'),
+        KeyCode::KeyR => Some('r'),
+        KeyCode::KeyS => Some('s'),
+        KeyCode::KeyT => Some('t'),
+        KeyCode::KeyU => Some('u'),
+        KeyCode::KeyV => Some('v'),
+        KeyCode::KeyW => Some('w'),
+        KeyCode::KeyX => Some('x'),
+        KeyCode::KeyY => Some('y'),
+        KeyCode::KeyZ => Some('z'),
+        _ => None,
+    }
+}
+
 pub fn is_cmd_q_pressed(mods: cef_event_flags_t, state: ElementState, physical: &PhysicalKey) -> bool {
     let cmd = (mods.0 & cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0) != 0;
-    cmd && state == ElementState::Pressed && matches!(physical, PhysicalKey::Code(KeyCode::KeyQ))
+    cmd
+        && state == ElementState::Pressed
+        && match physical {
+            PhysicalKey::Code(KeyCode::KeyQ) => true,
+            _ => false,
+        }
 }
 

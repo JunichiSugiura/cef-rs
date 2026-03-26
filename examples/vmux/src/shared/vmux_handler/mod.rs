@@ -1,11 +1,39 @@
+use cef::ImplBrowser as _;
+use cef::ImplFrame as _;
 use cef::*;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use winit::window::CursorIcon;
+use winit::event::KeyEvent;
+use winit::window::{CursorIcon, WindowId};
 
 use crate::shared::launch_trace;
+use crate::shared::vmux_osr::cef_pump;
 use crate::shared::vmux_osr::hub::{VmuxOsrAttach, WindowEntry};
+use crate::shared::vmux_osr::event_loop;
+
+const VMUX_LINK_HINTS_JS: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/link_hints.js"));
+
+/// After [`VmuxHandler::link_hints_feed_key`]: whether the hint session should stay armed in Rust.
+/// `data-vmux-hints` on `<html>` holds the fixed label width (stringified integer); when a DOM read
+/// lags after a key, Rust uses [`VmuxHandler::link_hints_feed_key`]'s `prior_typed_len` plus cached width.
+/// Typed prefix is tracked in Rust (`OsrVimMachine`) only.
+#[derive(Debug, Clone)]
+pub struct LinkHintsFeedOutcome {
+    pub still_active: bool,
+    /// Fixed code length for this page (from `data-vmux-hints` when the overlay is present; else best known).
+    pub hint_label_width: u8,
+}
+
+impl Default for LinkHintsFeedOutcome {
+    fn default() -> Self {
+        Self {
+            still_active: false,
+            hint_label_width: 1,
+        }
+    }
+}
 
 fn vmux_osr_cursor_from_cef(ty: CursorType) -> CursorIcon {
     match ty {
@@ -141,9 +169,7 @@ fn apply_osr_history_navigation(browser: &Browser, go_forward: bool) {
     } else {
         browser.go_back();
     }
-    for _ in 0..40 {
-        do_message_loop_work();
-    }
+    cef_pump::pump(40);
     let after = visible_navigation_url(browser);
     let stuck = match (&before, &after) {
         (Some(b), Some(a)) => b == a,
@@ -160,9 +186,7 @@ fn apply_osr_history_navigation(browser: &Browser, go_forward: bool) {
             let u = CefString::from(url.as_str());
             if let Some(frame) = browser.main_frame() {
                 frame.load_url(Some(&u));
-                for _ in 0..40 {
-                    do_message_loop_work();
-                }
+                cef_pump::pump(40);
             }
         }
     }
@@ -174,6 +198,47 @@ fn get_data_uri(data: &[u8], mime_type: &str) -> String {
     format!("data:{mime_type};base64,{uri}")
 }
 
+/// Whether this element is a control where the user normally types (CEF `is_editable` can miss
+/// some React / shadow-DOM / ARIA setups).
+fn dom_element_is_text_entry_host(node: &Domnode) -> bool {
+    use ImplDomnode as _;
+    if node.is_element() == 0 {
+        return false;
+    }
+    let tag = CefStringUtf8::from(&CefStringUtf16::from(&node.element_tag_name())).to_string();
+    let tag = tag.to_lowercase();
+    match tag.as_str() {
+        "textarea" => true,
+        "select" => true,
+        "input" => {
+            let ty = CefString::from("type");
+            let raw = node.element_attribute(Some(&ty));
+            let t = CefStringUtf8::from(&CefStringUtf16::from(&raw))
+                .to_string()
+                .to_lowercase();
+            match t.trim() {
+                "hidden" | "button" | "submit" | "reset" | "checkbox" | "radio" | "file"
+                | "image" | "range" | "color" => false,
+                _ => true,
+            }
+        }
+        _ => {
+            let role = CefString::from("role");
+            if node.has_element_attribute(Some(&role)) == 0 {
+                return false;
+            }
+            let raw = node.element_attribute(Some(&role));
+            let r = CefStringUtf8::from(&CefStringUtf16::from(&raw))
+                .to_string()
+                .to_lowercase();
+            match r.trim() {
+                "textbox" | "searchbox" | "combobox" | "spinbutton" => true,
+                _ => false,
+            }
+        }
+    }
+}
+
 /// Whether focus is in a context where **Shift+H** / **Shift+L** should go to the page.
 ///
 /// `focused_node()` is often a `#text` node; `is_editable()` may be false there while an ancestor has
@@ -183,6 +248,9 @@ fn dom_focused_context_allows_typing(mut node: Domnode) -> bool {
 
     for _ in 0..64 {
         if node.is_editable() != 0 {
+            return true;
+        }
+        if dom_element_is_text_entry_host(&node) {
             return true;
         }
         if node.is_element() != 0 {
@@ -250,6 +318,8 @@ pub struct VmuxHandler {
     /// Last `on_address_change` URL per OSR browser; used to OSR-repaint only on real navigations,
     /// not redundant callbacks.
     last_osr_address_url: HashMap<i32, String>,
+    /// Last `data-vmux-hints` label width per OSR browser (seeded at inject / refreshed while overlay reads active).
+    osr_link_hints_label_width: HashMap<i32, u8>,
 }
 
 impl VmuxHandler {
@@ -273,6 +343,7 @@ impl VmuxHandler {
                 bypass_windowless_do_close_guard: false,
                 osr_editable_focus_hint: HashMap::new(),
                 last_osr_address_url: HashMap::new(),
+                osr_link_hints_label_width: HashMap::new(),
             })
         })
     }
@@ -308,10 +379,21 @@ impl VmuxHandler {
         let Ok(inner) = handler.lock() else {
             return false;
         };
-        matches!(
-            inner.osr_editable_focus_hint.get(&browser_id),
-            Some(Some(false))
-        )
+        match inner.osr_editable_focus_hint.get(&browser_id) {
+            Some(Some(false)) => true,
+            _ => false,
+        }
+    }
+
+    /// Probe / `send_char` / IME marked this browser as having focus in a text control.
+    pub fn osr_editable_focus_is_typing(browser_id: i32) -> bool {
+        let Some(handler) = Self::instance() else {
+            return false;
+        };
+        let Ok(inner) = handler.lock() else {
+            return false;
+        };
+        matches!(inner.osr_editable_focus_hint.get(&browser_id), Some(Some(true)))
     }
 
     pub fn invalidate_osr_editable_focus_hint(browser_id: i32) {
@@ -372,26 +454,32 @@ impl VmuxHandler {
         frame.visit_dom(Some(&mut visitor));
     }
 
-    /// Refresh editable-focus hint on the CEF UI thread before handling **Shift+H** / **Shift+L**.
+    /// Refresh editable-focus hint on the CEF UI thread (async; does not block the winit thread).
     ///
     /// `pump_app_events` runs without CEF’s UI-thread marker even when both share the main thread,
     /// so `run_osr_editable_focus_probe_on_ui` would otherwise be skipped and the hint can stay
     /// stale (e.g. still “in a text field” after focus moved to the page).
     pub fn refresh_osr_editable_focus_hint_for_history(browser_id: i32) {
+        Self::schedule_osr_editable_focus_probe(browser_id);
+    }
+
+    /// Run the editable-focus probe then post [`event_loop::VmuxUserEvent::VimKeyReplay`] to the winit loop.
+    pub fn post_editable_probe_for_vim_replay(
+        browser_id: i32,
+        window_id: WindowId,
+        event: KeyEvent,
+    ) {
         if currently_on(ThreadId::UI) != 0 {
             Self::run_osr_editable_focus_probe_on_ui(browser_id);
+            event_loop::event_loop().send(event_loop::VmuxUserEvent::VimKeyReplay {
+                window_id,
+                event,
+            });
             return;
         }
-        let done = Arc::new(AtomicBool::new(false));
-        let mut task = SyncProbeOsrEditableFocus::new(browser_id, Arc::clone(&done));
+        let mut task = EditableProbeWakeTask::new(browser_id, window_id, event);
         if post_task(ThreadId::UI, Some(&mut task)) == 0 {
-            return;
-        }
-        for _ in 0..256 {
-            if done.load(Ordering::Acquire) {
-                return;
-            }
-            do_message_loop_work();
+            launch_trace("post_editable_probe_for_vim_replay: post_task failed");
         }
     }
 
@@ -411,22 +499,9 @@ impl VmuxHandler {
             let Some(handler) = Self::instance() else {
                 return;
             };
-            let done = Arc::new(AtomicBool::new(false));
-            let mut task = NavigateOsrBrowser::new(
-                handler,
-                browser_id,
-                go_forward,
-                Arc::clone(&done),
-            );
+            let mut task = NavigateOsrBrowser::new(handler, browser_id, go_forward);
             if post_task(thread_id, Some(&mut task)) == 0 {
                 launch_trace("navigate_osr_browser: post_task to UI thread failed");
-                return;
-            }
-            for _ in 0..8192 {
-                if done.load(Ordering::Acquire) {
-                    break;
-                }
-                do_message_loop_work();
             }
             return;
         }
@@ -440,22 +515,240 @@ impl VmuxHandler {
             let Some(handler) = Self::instance() else {
                 return;
             };
-            let done = Arc::new(AtomicBool::new(false));
-            let mut task = ReloadOsrBrowser::new(handler, browser_id, Arc::clone(&done));
+            let mut task = ReloadOsrBrowser::new(handler, browser_id);
             if post_task(thread_id, Some(&mut task)) == 0 {
                 launch_trace("reload_osr_browser: post_task to UI thread failed");
-                return;
-            }
-            for _ in 0..4096 {
-                if done.load(Ordering::Acquire) {
-                    break;
-                }
-                do_message_loop_work();
             }
             return;
         }
 
         Self::reload_osr_browser_on_ui(browser_id);
+    }
+
+    fn osr_browser_by_id(browser_id: i32) -> Option<Browser> {
+        let handler = Self::instance()?;
+        let attach = handler.lock().ok().and_then(|h| h.osr_attach.clone());
+        let from_store = attach.as_ref().and_then(|a| {
+            a.windows_store.lock().ok().and_then(|ws| {
+                ws.values()
+                    .find(|e| e.browser.identifier() == browser_id)
+                    .map(|e| e.browser.clone())
+            })
+        });
+        from_store.or_else(|| {
+            handler.lock().ok().and_then(|inner| {
+                inner
+                    .browser_list
+                    .iter()
+                    .find(|b| b.identifier() == browser_id)
+                    .cloned()
+            })
+        })
+    }
+
+    fn link_hints_clear_on_ui(browser_id: i32) {
+        debug_assert_ne!(currently_on(ThreadId::UI), 0);
+        let Some(browser) = Self::osr_browser_by_id(browser_id) else {
+            return;
+        };
+        // Always target the **main** frame: hints are injected there. If we used
+        // `focused_frame` first, focus could move into an iframe (e.g. Google ads);
+        // then probe/feed would run in the wrong document, return false, and Rust
+        // would clear `LinkHints` while the overlay still showed — second letter dead.
+        let Some(frame) = browser.main_frame().or_else(|| browser.focused_frame()) else {
+            return;
+        };
+        let code = CefString::from(
+            "try{window.__vmux_hints_cleanup&&window.__vmux_hints_cleanup();}catch(e){}",
+        );
+        let url = CefString::from("vmux://link-hints-clear");
+        frame.execute_java_script(Some(&code), Some(&url), 0);
+        if let Some(h) = Self::instance() {
+            if let Ok(mut inner) = h.lock() {
+                inner.osr_link_hints_label_width.remove(&browser_id);
+            }
+        }
+    }
+
+    fn link_hints_inject_on_ui(browser_id: i32) {
+        debug_assert_ne!(currently_on(ThreadId::UI), 0);
+        let Some(browser) = Self::osr_browser_by_id(browser_id) else {
+            return;
+        };
+        let Some(frame) = browser.main_frame().or_else(|| browser.focused_frame()) else {
+            return;
+        };
+        let code = CefString::from(VMUX_LINK_HINTS_JS);
+        let url = CefString::from("vmux://link-hints");
+        frame.execute_java_script(Some(&code), Some(&url), 0);
+        cef_pump::pump(8);
+        let snap = Self::link_hints_read_session_with_browser(&browser);
+        if let Some(h) = Self::instance() {
+            if let Ok(mut inner) = h.lock() {
+                if snap.still_active {
+                    inner
+                        .osr_link_hints_label_width
+                        .insert(browser_id, snap.hint_label_width.max(1));
+                }
+                inner.request_osr_window_redraw_for_browser(browser_id);
+            }
+        }
+    }
+
+    /// Show Vimium-style link hints in the given OSR browser (UI thread; pumps from winit if needed).
+    pub fn link_hints_show(browser_id: i32) {
+        let thread_id = ThreadId::UI;
+        if currently_on(thread_id) == 0 {
+            let Some(handler) = Self::instance() else {
+                return;
+            };
+            let mut task = LinkHintsRun::new(handler, browser_id, true);
+            if post_task(thread_id, Some(&mut task)) == 0 {
+                launch_trace("link_hints_show: post_task to UI thread failed");
+            }
+            return;
+        }
+        Self::link_hints_inject_on_ui(browser_id);
+    }
+
+    /// Remove link-hint overlay / listeners (same threading as `link_hints_show`).
+    pub fn link_hints_hide(browser_id: i32) {
+        let thread_id = ThreadId::UI;
+        if currently_on(thread_id) == 0 {
+            let Some(handler) = Self::instance() else {
+                return;
+            };
+            let mut task = LinkHintsRun::new(handler, browser_id, false);
+            if post_task(thread_id, Some(&mut task)) == 0 {
+                launch_trace("link_hints_hide: post_task to UI thread failed");
+            }
+            return;
+        }
+        Self::link_hints_clear_on_ui(browser_id);
+    }
+
+    /// Post link-hint feed to the CEF UI thread; completion is delivered via winit user events.
+    pub fn link_hints_feed_key_deferred(browser_id: i32, ch: char, prior_typed_len: usize) {
+        let thread_id = ThreadId::UI;
+        if currently_on(thread_id) != 0 {
+            let outcome = Self::link_hints_feed_key_on_ui(browser_id, ch, prior_typed_len);
+            if let Some(wid) = crate::shared::vmux_osr::bootstrap::hub().window_id_for_browser(browser_id)
+            {
+                event_loop::event_loop().send(event_loop::VmuxUserEvent::LinkHintFeed {
+                    window_id: wid,
+                    browser_id,
+                    ch,
+                    prior_typed_len,
+                    still_active: outcome.still_active,
+                    hint_label_width: outcome.hint_label_width,
+                });
+            }
+            return;
+        }
+        let Some(handler) = Self::instance() else {
+            return;
+        };
+        let mut task = LinkHintsFeedTask::new(handler, browser_id, ch, prior_typed_len);
+        if post_task(thread_id, Some(&mut task)) == 0 {
+            launch_trace("link_hints_feed_key_deferred: post_task to UI thread failed");
+        }
+    }
+
+    /// DOM snapshot for link hints — **does not** lock [`VmuxHandler`]; safe while `inner` is held.
+    fn link_hints_read_session_with_browser(browser: &Browser) -> LinkHintsFeedOutcome {
+        debug_assert_ne!(currently_on(ThreadId::UI), 0);
+        let out = Arc::new(Mutex::new(LinkHintsFeedOutcome::default()));
+        let Some(frame) = browser.main_frame().or_else(|| browser.focused_frame()) else {
+            return LinkHintsFeedOutcome::default();
+        };
+        let mut visitor = LinkHintsSessionDomVisitor::new(Arc::clone(&out));
+        frame.visit_dom(Some(&mut visitor));
+        out.lock().ok().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn link_hints_read_session_on_ui(browser_id: i32) -> LinkHintsFeedOutcome {
+        let Some(browser) = Self::osr_browser_by_id(browser_id) else {
+            return LinkHintsFeedOutcome::default();
+        };
+        Self::link_hints_read_session_with_browser(&browser)
+    }
+
+    /// `prior_typed_len`: Rust hint prefix length **before** this key (see [`OsrVimMachine::link_hints_typed_prefix`]).
+    fn link_hints_finalize_feed_outcome(
+        snap: LinkHintsFeedOutcome,
+        browser_id: i32,
+        prior_typed_len: usize,
+    ) -> LinkHintsFeedOutcome {
+        let w_from_dom = snap.hint_label_width.max(1);
+        if snap.still_active {
+            if let Some(h) = Self::instance() {
+                if let Ok(mut inner) = h.lock() {
+                    inner
+                        .osr_link_hints_label_width
+                        .insert(browser_id, w_from_dom);
+                }
+            }
+            return LinkHintsFeedOutcome {
+                still_active: true,
+                hint_label_width: w_from_dom,
+            };
+        }
+        let w_cached = Self::instance()
+            .and_then(|h| h.lock().ok().and_then(|inner| {
+                inner.osr_link_hints_label_width.get(&browser_id).copied()
+            }))
+            .unwrap_or(2)
+            .max(1);
+        let still = prior_typed_len > 0 && prior_typed_len + 1 < w_cached as usize;
+        LinkHintsFeedOutcome {
+            still_active: still,
+            hint_label_width: w_cached,
+        }
+    }
+
+    fn link_hints_feed_key_on_ui(browser_id: i32, ch: char, prior_typed_len: usize) -> LinkHintsFeedOutcome {
+        debug_assert_ne!(currently_on(ThreadId::UI), 0);
+        if !ch.is_ascii_lowercase() {
+            return Self::link_hints_read_session_on_ui(browser_id);
+        }
+        let Some(browser) = Self::osr_browser_by_id(browser_id) else {
+            return LinkHintsFeedOutcome::default();
+        };
+        let Some(frame) = browser.main_frame().or_else(|| browser.focused_frame()) else {
+            return LinkHintsFeedOutcome::default();
+        };
+        let code = format!(
+            "try{{if(typeof window.__vmux_hints_feed==='function')window.__vmux_hints_feed('{}');}}catch(e){{}}",
+            ch
+        );
+        let code = CefString::from(code.as_str());
+        let url = CefString::from("vmux://link-hints-feed");
+        frame.execute_java_script(Some(&code), Some(&url), 0);
+        cef_pump::pump(12);
+        if let Some(h) = Self::instance() {
+            if let Ok(inner) = h.lock() {
+                inner.request_osr_window_redraw_for_browser(browser_id);
+            }
+        }
+        let snap = Self::link_hints_read_session_with_browser(&browser);
+        Self::link_hints_finalize_feed_outcome(snap, browser_id, prior_typed_len)
+    }
+
+    /// Feed one hint letter (UI thread only). From the winit thread use [`Self::link_hints_feed_key_deferred`].
+    pub fn link_hints_feed_key(
+        browser_id: i32,
+        ch: char,
+        prior_typed_len: usize,
+    ) -> LinkHintsFeedOutcome {
+        let thread_id = ThreadId::UI;
+        if currently_on(thread_id) != 0 {
+            return Self::link_hints_feed_key_on_ui(browser_id, ch, prior_typed_len);
+        }
+        Self::link_hints_feed_key_deferred(browser_id, ch, prior_typed_len);
+        LinkHintsFeedOutcome {
+            still_active: true,
+            ..Default::default()
+        }
     }
 
     fn reload_osr_browser_on_ui(browser_id: i32) {
@@ -487,9 +780,7 @@ impl VmuxHandler {
         let bid = browser.identifier();
         let hub = crate::shared::vmux_osr::bootstrap::hub();
         hub.reset_paint_redraw_throttle(bid);
-        for _ in 0..24 {
-            do_message_loop_work();
-        }
+        cef_pump::pump(24);
         if let Ok(inner) = handler.lock() {
             inner.request_osr_window_redraw_for_browser(bid);
         }
@@ -542,39 +833,31 @@ impl VmuxHandler {
         let hub = crate::shared::vmux_osr::bootstrap::hub();
         hub.reset_paint_redraw_throttle(bid);
         osr_repaint_full_geometry(&browser);
-        for _ in 0..10 {
-            do_message_loop_work();
-        }
+        cef_pump::pump(10);
         hub.reset_paint_redraw_throttle(bid);
         osr_repaint_full_geometry(&browser);
-        for _ in 0..10 {
-            do_message_loop_work();
-        }
+        cef_pump::pump(10);
         for _ in 0..3 {
             if let Ok(inner) = handler.lock() {
                 inner.request_osr_window_redraw_for_browser(bid);
             }
-            for _ in 0..4 {
-                do_message_loop_work();
-            }
+            cef_pump::pump(4);
         }
-        Self::osr_navigation_repaint_followup_on_ui(bid);
+        Self::osr_navigation_repaint_pass_on_ui(bid);
         if let Ok(mut inner) = handler.lock() {
             // So the next `on_address_change` is not skipped as "unchanged" vs `last_osr_address_url`.
             inner.last_osr_address_url.remove(&bid);
             inner.sync_osr_title_from_visible_navigation(&browser);
-            // Skip `nudge_osr_compositor_after_address_change`: we already ran two full repaints +
-            // followup; another `was_resized`/`invalidate` pass dominated history navigation latency.
+            // Skip `nudge_osr_compositor_after_address_change`: we already ran two full repaints and
+            // an extra repaint pass; another `was_resized`/`invalidate` pass dominated history navigation latency.
             inner.request_osr_window_redraw_for_browser(bid);
         }
-        for _ in 0..3 {
-            do_message_loop_work();
-        }
+        cef_pump::pump(3);
         let mut delayed = OsrDelayedNavigationRepaint::new(bid);
         let _ = post_delayed_task(ThreadId::UI, Some(&mut delayed), 75);
     }
 
-    fn osr_navigation_repaint_followup_on_ui(browser_id: i32) {
+    fn osr_navigation_repaint_pass_on_ui(browser_id: i32) {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
         let Some(handler) = Self::instance() else {
             return;
@@ -594,9 +877,7 @@ impl VmuxHandler {
         };
         crate::shared::vmux_osr::bootstrap::hub().reset_paint_redraw_throttle(browser_id);
         osr_repaint_full_geometry(&browser);
-        for _ in 0..14 {
-            do_message_loop_work();
-        }
+        cef_pump::pump(14);
         if let Ok(inner) = handler.lock() {
             inner.request_osr_window_redraw_for_browser(browser_id);
         }
@@ -652,9 +933,7 @@ impl VmuxHandler {
         crate::shared::vmux_osr::bootstrap::hub().reset_paint_redraw_throttle(bid);
         osr_repaint_full_geometry(browser);
         self.request_osr_window_redraw_for_browser(bid);
-        for _ in 0..4 {
-            do_message_loop_work();
-        }
+        cef_pump::pump(4);
     }
 
     fn on_osr_address_changed(&mut self, browser: &Browser, url: Option<&CefString>) {
@@ -672,6 +951,20 @@ impl VmuxHandler {
         self.sync_osr_title_from_visible_navigation(browser);
         if changed {
             self.nudge_osr_compositor_after_address_change(browser);
+            // SPAs often call `pushState` / update the visible URL on unrelated activity. That used
+            // to queue hint invalidation here; the next winit key event applied it *before* handling
+            // the second hint letter, so Rust dropped `LinkHints` while the overlay was still up.
+            //
+            // If the hint marker is still on `<html>`, keep the session; real navigations replace
+            // the document and the probe goes false (invalidate then). When not on the UI thread,
+            // fall back to always invalidating.
+            // Must not call `link_hints_probe_active_on_ui` here: it locks `VmuxHandler` while we
+            // already hold `inner` from the display handler → deadlock / abort.
+            let overlay_likely_up = currently_on(ThreadId::UI) != 0
+                && Self::link_hints_read_session_with_browser(browser).still_active;
+            if !overlay_likely_up {
+                crate::shared::vmux_osr::bootstrap::hub().invalidate_link_hints_for_browser(bid);
+            }
         } else {
             // Same URL string again (redirect noise, BFCache, etc.) — still schedule a frame; OSR can
             // otherwise keep presenting an old texture after in-session navigations.
@@ -683,9 +976,7 @@ impl VmuxHandler {
                 ))]
                 host.send_external_begin_frame();
             }
-            for _ in 0..4 {
-                do_message_loop_work();
-            }
+            cef_pump::pump(4);
         }
     }
 
@@ -730,9 +1021,7 @@ impl VmuxHandler {
                     host.send_external_begin_frame();
                 }
                 self.request_osr_window_redraw_for_browser(bid);
-                for _ in 0..4 {
-                    do_message_loop_work();
-                }
+                cef_pump::pump(4);
             }
         }
     }
@@ -1149,6 +1438,7 @@ wrap_load_handler! {
                 return;
             }
             if is_loading != 0 {
+                crate::shared::vmux_osr::bootstrap::hub().invalidate_link_hints_for_browser(bid);
                 if let Some(host) = browser.host() {
                     host.invalidate(PaintElementType::VIEW);
                     #[cfg(all(
@@ -1160,9 +1450,7 @@ wrap_load_handler! {
                 if let Ok(inner) = self.inner.lock() {
                     inner.request_osr_window_redraw_for_browser(bid);
                 }
-                for _ in 0..5 {
-                    do_message_loop_work();
-                }
+                cef_pump::pump(5);
                 return;
             }
             osr_repaint_full_geometry(&browser);
@@ -1173,6 +1461,45 @@ wrap_load_handler! {
                 inner.request_osr_window_redraw_for_browser(bid);
             }
             VmuxHandler::schedule_osr_editable_focus_probe(bid);
+        }
+    }
+}
+
+wrap_domvisitor! {
+    struct LinkHintsSessionDomVisitor {
+        out: Arc<Mutex<LinkHintsFeedOutcome>>,
+    }
+
+    impl Domvisitor {
+        fn visit(&self, document: Option<&mut Domdocument>) {
+            use ImplDomdocument as _;
+            use ImplDomnode as _;
+            let (active, width) = match document {
+                None => (false, 1u8),
+                Some(doc) => doc
+                    .document()
+                    .map(|root| {
+                        let hints = CefString::from("data-vmux-hints");
+                        let active = root.has_element_attribute(Some(&hints)) != 0;
+                        let width = if active {
+                            let raw = root.element_attribute(Some(&hints));
+                            let s = CefStringUtf8::from(&CefStringUtf16::from(&raw))
+                                .to_string();
+                            s.trim()
+                                .parse::<u8>()
+                                .unwrap_or(2)
+                                .clamp(1, 32)
+                        } else {
+                            1u8
+                        };
+                        (active, width)
+                    })
+                    .unwrap_or((false, 1u8)),
+            };
+            if let Ok(mut g) = self.out.lock() {
+                g.still_active = active;
+                g.hint_label_width = width;
+            }
         }
     }
 }
@@ -1193,9 +1520,16 @@ wrap_domvisitor! {
                     .unwrap_or(false),
             };
             if let Ok(mut inner) = self.handler.lock() {
+                // A late probe must not clear `Some(true)` set by `send_char` / IME while the DOM
+                // visitor still misses the control (e.g. custom search UIs). Only `invalidate` or a
+                // successful `true` from the probe should establish typing; we never downgrade true→false here.
+                let merged = match inner.osr_editable_focus_hint.get(&self.browser_id) {
+                    Some(Some(true)) if !editable => true,
+                    _ => editable,
+                };
                 inner
                     .osr_editable_focus_hint
-                    .insert(self.browser_id, Some(editable));
+                    .insert(self.browser_id, Some(merged));
             }
         }
     }
@@ -1217,16 +1551,20 @@ wrap_task! {
 }
 
 wrap_task! {
-    struct SyncProbeOsrEditableFocus {
+    struct EditableProbeWakeTask {
         browser_id: i32,
-        done: Arc<AtomicBool>,
+        window_id: WindowId,
+        event: KeyEvent,
     }
 
     impl Task {
         fn execute(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
             VmuxHandler::run_osr_editable_focus_probe_on_ui(self.browser_id);
-            self.done.store(true, Ordering::Release);
+            event_loop::event_loop().send(event_loop::VmuxUserEvent::VimKeyReplay {
+                window_id: self.window_id,
+                event: self.event.clone(),
+            });
         }
     }
 }
@@ -1236,7 +1574,6 @@ wrap_task! {
         inner: Arc<Mutex<VmuxHandler>>,
         browser_id: i32,
         go_forward: bool,
-        done: Arc<AtomicBool>,
     }
 
     impl Task {
@@ -1244,7 +1581,6 @@ wrap_task! {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
             let _ = &self.inner;
             VmuxHandler::navigate_osr_browser_on_ui(self.browser_id, self.go_forward);
-            self.done.store(true, Ordering::Release);
         }
     }
 }
@@ -1253,7 +1589,6 @@ wrap_task! {
     struct ReloadOsrBrowser {
         inner: Arc<Mutex<VmuxHandler>>,
         browser_id: i32,
-        done: Arc<AtomicBool>,
     }
 
     impl Task {
@@ -1261,7 +1596,60 @@ wrap_task! {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
             let _ = &self.inner;
             VmuxHandler::reload_osr_browser_on_ui(self.browser_id);
-            self.done.store(true, Ordering::Release);
+        }
+    }
+}
+
+wrap_task! {
+    struct LinkHintsRun {
+        inner: Arc<Mutex<VmuxHandler>>,
+        browser_id: i32,
+        show: bool,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            debug_assert_ne!(currently_on(ThreadId::UI), 0);
+            let _ = &self.inner;
+            if self.show {
+                VmuxHandler::link_hints_inject_on_ui(self.browser_id);
+            } else {
+                VmuxHandler::link_hints_clear_on_ui(self.browser_id);
+            }
+        }
+    }
+}
+
+wrap_task! {
+    struct LinkHintsFeedTask {
+        inner: Arc<Mutex<VmuxHandler>>,
+        browser_id: i32,
+        ch: char,
+        prior_typed_len: usize,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            debug_assert_ne!(currently_on(ThreadId::UI), 0);
+            let _ = &self.inner;
+            let v = VmuxHandler::link_hints_feed_key_on_ui(
+                self.browser_id,
+                self.ch,
+                self.prior_typed_len,
+            );
+            let Some(wid) =
+                crate::shared::vmux_osr::bootstrap::hub().window_id_for_browser(self.browser_id)
+            else {
+                return;
+            };
+            event_loop::event_loop().send(event_loop::VmuxUserEvent::LinkHintFeed {
+                window_id: wid,
+                browser_id: self.browser_id,
+                ch: self.ch,
+                prior_typed_len: self.prior_typed_len,
+                still_active: v.still_active,
+                hint_label_width: v.hint_label_width,
+            });
         }
     }
 }
@@ -1300,9 +1688,7 @@ wrap_task! {
             let bid = self.browser_id;
             crate::shared::vmux_osr::bootstrap::hub().reset_paint_redraw_throttle(bid);
             osr_repaint_full_geometry(&browser);
-            for _ in 0..10 {
-                do_message_loop_work();
-            }
+            cef_pump::pump(10);
             if let Ok(inner) = handler.lock() {
                 inner.request_osr_window_redraw_for_browser(bid);
             }
