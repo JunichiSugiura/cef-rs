@@ -4,7 +4,10 @@
 //! [`ingest_winit_window_dispatches_system`] turns each queued pair into a [`OsrHostWindowDispatch`](crate::browser::renderer::osr_host::window_effect::OsrHostWindowDispatch) event;
 //! [`apply_osr_host_window_dispatches_system`] runs after browser entity spawn/despawn (see
 //! [`crate::browser::event_loop::WinitPlugin`]) and before [`crate::browser::shell_ops::apply_browser_ui_ops_system`], calling
-//! [`crate::window::dispatch::handle_window_event`] in FIFO order for each dispatch.
+//! [`crate::window::dispatch::handle_window_event`] in FIFO order for each dispatch. It forwards
+//! [`NavigateBrowserEvent`], [`ReloadBrowserEvent`], link-hints show/hide, feed-deferred, and quit
+//! shell batches from [`crate::vimium::window_input::BrowserEventBatch`] into Bevy events (same as
+//! vimium replay does for its subset).
 //!
 //! Each batch is dispatched with [`crate::browser::browser_entity::BrowserWindowId`] / [`crate::browser::browser_entity::BrowserId`]
 //! resolved via ECS `Query` so handlers can align CEF `browser_id` with browser entities.
@@ -20,8 +23,9 @@ use winit::event::WindowEvent;
 use winit::window::WindowId;
 
 use crate::browser::events::{
-    ArmWindowlessCloseBrowserEvent, LinkHintsFeedKeyDeferredBrowserEvent, NavigateBrowserEvent,
-    QuitCloseAllBrowsersBrowserEvent,
+    ArmWindowlessCloseBrowserEvent, LinkHintsFeedKeyDeferredBrowserEvent, LinkHintsHideBrowserEvent,
+    LinkHintsShowBrowserEvent, NavigateBrowserEvent, QuitCloseAllBrowsersBrowserEvent,
+    ReloadBrowserEvent,
 };
 use crate::browser::browser_entity::{BrowserId, BrowserWindowId};
 use crate::browser::event_loop::{LinkHintsNavPending, RuntimeState};
@@ -68,6 +72,9 @@ pub fn apply_osr_host_window_dispatches_system(
     focus_q: Query<(&BrowserId, &EditableFocusHint)>,
     mut dispatches: EventReader<OsrHostWindowDispatch>,
     mut navigate_events: EventWriter<NavigateBrowserEvent>,
+    mut reload_events: EventWriter<ReloadBrowserEvent>,
+    mut link_hints_show_events: EventWriter<LinkHintsShowBrowserEvent>,
+    mut link_hints_hide_events: EventWriter<LinkHintsHideBrowserEvent>,
     mut link_hints_feed_events: EventWriter<LinkHintsFeedKeyDeferredBrowserEvent>,
     mut arm_windowless_close_events: EventWriter<ArmWindowlessCloseBrowserEvent>,
     mut quit_close_events: EventWriter<QuitCloseAllBrowsersBrowserEvent>,
@@ -97,6 +104,15 @@ pub fn apply_osr_host_window_dispatches_system(
     }
     for ev in out.navigate {
         navigate_events.send(ev);
+    }
+    for ev in out.reload {
+        reload_events.send(ev);
+    }
+    for ev in out.link_hints_show {
+        link_hints_show_events.send(ev);
+    }
+    for ev in out.link_hints_hide {
+        link_hints_hide_events.send(ev);
     }
     for ev in out.link_hints_feed_key_deferred {
         link_hints_feed_events.send(ev);

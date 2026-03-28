@@ -2,6 +2,7 @@
 
 pub mod state;
 pub mod lifecycle;
+pub mod quit_feedback;
 pub mod window_effect;
 pub mod titles;
 #[cfg(target_os = "macos")]

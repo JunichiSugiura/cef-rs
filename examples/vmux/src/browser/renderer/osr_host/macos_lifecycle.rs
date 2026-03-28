@@ -44,6 +44,7 @@ define_class!(
 
         #[unsafe(method(terminate:))]
         unsafe fn terminate(&self, _sender: &AnyObject) {
+            crate::browser::renderer::osr_host::quit_feedback::try_begin_quit_visual_feedback();
             request_graceful_shutdown();
         }
     }

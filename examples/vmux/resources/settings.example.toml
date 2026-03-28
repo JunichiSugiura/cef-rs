@@ -4,8 +4,8 @@
 [browser]
 # Max DOM ancestor hops when probing whether the focused context allows typing (editable / text entry).
 dom_focus_ancestor_walk_max = 64
-# First window loads this URL on startup. Omit or use "" for the built-in default (Google; vmux loads
-# `about:blank` first then navigates here for http(s) URLs).
+# First window loads this URL on startup. Omit or use "" for the built-in default (Google); empty
+# uses `about:blank` then that default. http(s) URLs load directly (no extra history entry).
 startup_url = "https://www.google.com"
 
 [vimium]

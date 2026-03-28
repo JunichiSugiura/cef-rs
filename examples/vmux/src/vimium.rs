@@ -5,15 +5,21 @@ pub mod modes;
 pub mod scroll;
 pub mod state;
 pub mod editable_gating;
+pub mod input_trace;
 pub mod window_input;
 
 use bevy_app::{App as BevyApp, Plugin, Update};
 use bevy_ecs::event::{EventReader, EventWriter};
+use bevy_ecs::entity::Entity;
 use bevy_ecs::prelude::{NonSend, NonSendMut, Query, Res, ResMut, Resource};
+use bevy_ecs::schedule::IntoSystemConfigs;
+use winit::window::WindowId;
+
+use crate::browser::shell_ops::apply_browser_ui_ops_system;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
-use crate::browser::browser_entity::BrowserId;
+use crate::browser::browser_entity::{BrowserId, BrowserWindowId};
 use crate::browser::event_loop::RuntimeState;
 use crate::browser::events::{
     LinkHintsHideBrowserEvent, LinkHintsShowBrowserEvent, NavigateBrowserEvent, ReloadBrowserEvent,
@@ -67,6 +73,10 @@ pub struct VimiumRuntimeResource {
 
 impl Plugin for VimiumPlugin {
     fn build(&self, app: &mut BevyApp) {
+        // Deferred keys: DOM probe enqueues `SetEditableFocusHint` before `VimiumKeyReplayEvent`.
+        // Run after `apply_browser_ui_ops_system` so replay sees updated hints; replay also passes
+        // ECS `(Entity, browser_id)` so `browser_id_for_window` still resolves if `windows_store`
+        // lags the first frame.
         app.init_resource::<VimiumRuntimeResource>().add_systems(
             Update,
             (
@@ -74,33 +84,38 @@ impl Plugin for VimiumPlugin {
                 apply_link_hint_feed_events_system,
                 apply_find_mode_key_queue_system,
                 sync_vimium_runtime_resource_system,
-            ),
+            )
+                .after(apply_browser_ui_ops_system),
         );
     }
 }
 
-fn apply_vimium_key_replay_events_system(
+pub(crate) fn apply_vimium_key_replay_events_system(
     mut events: EventReader<crate::browser::event_loop::VimiumKeyReplayEvent>,
     mut osr_host: NonSendMut<crate::browser::renderer::osr_host::state::OsrHostState>,
     mut rt: ResMut<RuntimeState>,
     mut vim: ResMut<VimiumStateResource>,
-    focus_q: Query<(&BrowserId, &EditableFocusHint)>,
+    browser_q: Query<(Entity, &BrowserWindowId, &BrowserId, &EditableFocusHint)>,
     mut navigate_events: EventWriter<NavigateBrowserEvent>,
     mut reload_events: EventWriter<ReloadBrowserEvent>,
     mut link_hints_show_events: EventWriter<LinkHintsShowBrowserEvent>,
     mut link_hints_hide_events: EventWriter<LinkHintsHideBrowserEvent>,
 ) {
     let mut editable_focus: EditableFocusSnapshot = HashMap::new();
-    for (bid, hint) in focus_q.iter() {
+    let mut ecs_by_window: HashMap<WindowId, (Entity, i32)> = HashMap::new();
+    for (entity, wid, bid, hint) in browser_q.iter() {
         editable_focus.insert(bid.0, hint.0);
+        ecs_by_window.insert(wid.0, (entity, bid.0));
     }
     for event in events.read() {
+        let ecs = ecs_by_window.get(&event.window_id).copied();
         let mut out = BrowserEventBatch::default();
         window_input::handle_vimium_key_replay_event(
             &mut osr_host,
             &mut rt,
             &mut vim.0,
             event.clone(),
+            ecs,
             &editable_focus,
             &mut out,
         );

@@ -51,7 +51,7 @@ pub(crate) fn handle_window_event(
     // Vimium-style bindings (`settings.toml` `[vimium]`, defaults like j/k/d/u, shift+h/l, gg, shift+g, r).
     // Find mode swallows key-up here so CEF does not get unmatched KEYUP.
     if let WindowEvent::KeyboardInput { event, .. } = &event {
-        if window_input::try_handle_vimium_keys(
+        let vimium_handled = window_input::try_handle_vimium_keys(
             osr_host,
             rt,
             vim,
@@ -60,8 +60,9 @@ pub(crate) fn handle_window_event(
             ecs_browser,
             editable_focus,
             out,
-        )
-        {
+        );
+        crate::vimium::input_trace::keyboard_vimium(window_id, vimium_handled, event);
+        if vimium_handled {
             return;
         }
     }
@@ -135,6 +136,7 @@ pub(crate) fn handle_window_event(
                     crate::lifecycle_trace::record_runtime_event(
                         "window_dispatch Cmd+Q quit_close_all_browsers queued",
                     );
+                    crate::browser::renderer::osr_host::quit_feedback::try_begin_quit_visual_feedback();
                     rt.quit_requested = true;
                     out.quit_close_all_browsers
                         .push(crate::browser::events::QuitCloseAllBrowsersBrowserEvent);
@@ -169,7 +171,7 @@ pub(crate) fn handle_window_event(
                 h.set_focus(1);
             }
 
-            let hint_ch = keyboard::lowercase_letter_from_physical(&event.physical_key);
+            let hint_ch = keyboard::hint_label_char_from_key_event(&event);
 
             // While `LinkHints` is armed, do **not** run editable-focus dismiss from here.
             // Google (and similar) often keeps a search `<input>` in the tree; probing after
@@ -274,6 +276,7 @@ pub(crate) fn handle_window_event(
             {
                 match event.state {
                     ElementState::Pressed => {
+                        crate::vimium::input_trace::keyboard_forward_cef_keydown(bid, &event, vk);
                         // On macOS shortcuts (e.g. Cmd+A) often require KEYDOWN delivery,
                         // while some navigation expects RAWKEYDOWN. Send both.
                         for type_ in [KeyEventType::RAWKEYDOWN, KeyEventType::KEYDOWN] {
@@ -315,6 +318,7 @@ pub(crate) fn handle_window_event(
                     rt.mods_winit.super_key() || rt.mods_winit.control_key();
                 if !hints_active && !has_shortcut_mod {
                     if let Some(text) = &event.text {
+                        crate::vimium::input_trace::keyboard_forward_send_char(bid, text.as_str());
                         let mut any = false;
                         for ch in text.chars() {
                             keyboard::send_char(&host, rt.mods, ch);
@@ -354,13 +358,46 @@ pub(crate) fn handle_window_event(
             let Some(entry) = windows.get(&window_id) else {
                 return;
             };
+            let browser = entry.browser.clone();
             #[cfg(target_os = "macos")]
             let window = entry.surface.window.clone();
-            let Some(host) = entry.browser.host() else {
+            drop(windows);
+
+            let Some(host) = browser.host() else {
                 return;
             };
             host.set_focus(1);
-            let bid = entry.browser.identifier();
+            let bid = browser.identifier();
+            crate::vimium::input_trace::ime_event(window_id, bid, &ime);
+            if let winit::event::Ime::Commit(text) = &ime {
+                let vimium_handled = window_input::try_handle_vimium_ime_commit(
+                    osr_host,
+                    rt,
+                    vim,
+                    window_id,
+                    bid,
+                    text.as_str(),
+                    editable_focus,
+                    out,
+                );
+                crate::vimium::input_trace::ime_commit_vimium_result(
+                    bid,
+                    text.as_str(),
+                    vimium_handled,
+                );
+                if vimium_handled {
+                    #[cfg(target_os = "macos")]
+                    {
+                        if !window.has_focus() {
+                            window.focus_window();
+                        }
+                        host.set_focus(1);
+                        rt.macos_shell_refocus_window = Some(window_id);
+                        rt.macos_shell_refocus_ticks = rt.macos_shell_refocus_ticks.max(8);
+                    }
+                    return;
+                }
+            }
             // `KeyboardInput` for hint letters is swallowed, but macOS still emits `Ime::Commit`
             // for the same physical key; forwarding it would inject into the page (e.g. second
             // letter of hint "by") and sites like Ledger show "press / for search" when focus
@@ -397,6 +434,7 @@ pub(crate) fn handle_window_event(
                 }
             }
             if let winit::event::Ime::Commit(text) = ime {
+                crate::vimium::input_trace::ime_forward_send_char(bid, text.as_str());
                 for ch in text.chars() {
                     keyboard::send_char(&host, rt.mods, ch);
                 }

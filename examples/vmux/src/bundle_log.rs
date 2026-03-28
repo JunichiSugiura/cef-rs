@@ -1,5 +1,6 @@
 //! Persistent Bevy / tracing logs beside the `.app` (same directory as `debug.log` and
 //! `vmux-rust-panic.log`). Override with **`VMUX_BEVY_LOG`** (absolute or relative path).
+//! For vimium vs IME / keyboard tracing, set **`VMUX_VIMIUM_INPUT_LOG=1`** (see [`crate::vimium::input_trace`]).
 //!
 //! **Where to look:** for `…/Foo.app`, the default file is **`…/vmux-bevy.log`** (sibling of the
 //! bundle folder), not inside `Contents/`. A one-line pointer **`vmux-bevy-log-path.txt`** is written

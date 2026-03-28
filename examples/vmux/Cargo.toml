@@ -53,11 +53,13 @@ objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit = { workspace = true, features = [
     "NSApplication",
+    "NSCursor",
     "NSEvent",
     "NSResponder",
     "NSUserInterfaceValidation",
     "NSView",
     "NSWindow",
+    "objc2-core-foundation",
 ] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

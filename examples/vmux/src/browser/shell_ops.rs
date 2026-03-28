@@ -43,36 +43,64 @@ pub fn apply_browser_ui_ops_system(
     if ops.is_empty() {
         return;
     }
+    let mut missed: Vec<BrowserUiOp> = Vec::new();
     for op in ops {
         match op {
             BrowserUiOp::InvalidateEditableFocusHint { browser_id } => {
+                let mut hit = false;
                 for (bid, mut hint, _) in &mut hints {
                     if bid.0 == browser_id {
                         hint.0 = None;
+                        hit = true;
                         break;
                     }
+                }
+                if !hit {
+                    missed.push(BrowserUiOp::InvalidateEditableFocusHint { browser_id });
                 }
             }
             BrowserUiOp::SetEditableFocusHint {
                 browser_id,
                 editable,
             } => {
+                let mut hit = false;
                 for (bid, mut hint, _) in &mut hints {
                     if bid.0 == browser_id {
                         hint.0 = Some(editable);
+                        hit = true;
                         break;
                     }
                 }
+                if !hit {
+                    missed.push(BrowserUiOp::SetEditableFocusHint {
+                        browser_id,
+                        editable,
+                    });
+                }
             }
             BrowserUiOp::RemoveBrowserEntries { browser_id } => {
+                let mut hit = false;
                 for (bid, mut hint, mut last_url) in &mut hints {
                     if bid.0 == browser_id {
                         hint.0 = None;
                         last_url.0 = None;
+                        hit = true;
                         break;
                     }
                 }
+                if !hit {
+                    missed.push(BrowserUiOp::RemoveBrowserEntries { browser_id });
+                }
             }
+        }
+    }
+    if missed.is_empty() {
+        return;
+    }
+    if let Ok(mut q) = queue.0.lock() {
+        const CAP: usize = 64;
+        for op in missed.into_iter().take(CAP) {
+            q.push_back(op);
         }
     }
 }

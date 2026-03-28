@@ -8,11 +8,12 @@ pub const DEFAULT_DOM_FOCUS_ANCESTOR_WALK_MAX: usize = 64;
 
 /// Default first tab URL when `[browser] startup_url` is missing or empty.
 ///
-/// Staged startup loads `about:blank` first, then navigates here for `http`/`https` (see
+/// `http`/`https` values load directly (no leading `about:blank` in history). If this is empty,
+/// vmux loads `about:blank` then the built-in default (see
 /// [`OsrHostState::staged_initial_navigation_url`](crate::browser::renderer::OsrHostState::staged_initial_navigation_url)).
 ///
 /// Default matches pass criteria (`open` does not pass env). Staged startup still loads
-/// `about:blank` first for `https` URLs (see `OsrHostState::staged_initial_navigation_url`).
+/// Direct load for `https`/`http` startup URLs (see `OsrHostState::staged_initial_navigation_url`).
 pub const DEFAULT_STARTUP_URL: &str = "https://www.google.com";
 
 use std::path::PathBuf;
@@ -370,6 +371,141 @@ pub fn chord_matches_winit(
         && chord.cmd == mods.super_key()
 }
 
+#[inline]
+fn winit_single_char_from_text_or_logical(
+    text: Option<&str>,
+    logical_key: &winit::keyboard::Key,
+) -> Option<char> {
+    if let Some(t) = text {
+        let mut it = t.chars();
+        if let Some(c) = it.next() {
+            if it.next().is_none() {
+                return Some(c);
+            }
+        }
+    }
+    match logical_key {
+        winit::keyboard::Key::Character(s) => {
+            let mut it = s.chars();
+            let c = it.next()?;
+            if it.next().is_none() {
+                Some(c)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Like [`chord_matches_winit`], but when the physical key is wrong or [`PhysicalKey::Unidentified`]
+/// (common on macOS while a web control has focus), match a single `KeyEvent::text` /
+/// [`KeyEvent::logical_key`] character the same way as [`chord_matches_winit_ime_char`].
+pub fn chord_matches_winit_or_text(
+    chord: &KeyChord,
+    mods: winit::keyboard::ModifiersState,
+    physical: &winit::keyboard::PhysicalKey,
+    text: Option<&str>,
+    logical_key: &winit::keyboard::Key,
+) -> bool {
+    if chord_matches_winit(chord, mods, physical) {
+        return true;
+    }
+    if chord.shift != mods.shift_key()
+        || chord.ctrl != mods.control_key()
+        || chord.alt != mods.alt_key()
+        || chord.cmd != mods.super_key()
+    {
+        return false;
+    }
+    if chord.matches_physical_key(physical) {
+        return false;
+    }
+    let Some(c0) = winit_single_char_from_text_or_logical(text, logical_key) else {
+        return false;
+    };
+    chord_matches_winit_ime_char(chord, mods, c0)
+}
+
+#[derive(Clone, Copy)]
+enum ImeKeyExpect {
+    Letter(char),
+    Char(char),
+}
+
+fn key_code_ime_expect(k: KeyCode) -> Option<ImeKeyExpect> {
+    use KeyCode::*;
+    match k {
+        KeyA => Some(ImeKeyExpect::Letter('a')),
+        KeyB => Some(ImeKeyExpect::Letter('b')),
+        KeyC => Some(ImeKeyExpect::Letter('c')),
+        KeyD => Some(ImeKeyExpect::Letter('d')),
+        KeyE => Some(ImeKeyExpect::Letter('e')),
+        KeyF => Some(ImeKeyExpect::Letter('f')),
+        KeyG => Some(ImeKeyExpect::Letter('g')),
+        KeyH => Some(ImeKeyExpect::Letter('h')),
+        KeyI => Some(ImeKeyExpect::Letter('i')),
+        KeyJ => Some(ImeKeyExpect::Letter('j')),
+        KeyK => Some(ImeKeyExpect::Letter('k')),
+        KeyL => Some(ImeKeyExpect::Letter('l')),
+        KeyM => Some(ImeKeyExpect::Letter('m')),
+        KeyN => Some(ImeKeyExpect::Letter('n')),
+        KeyO => Some(ImeKeyExpect::Letter('o')),
+        KeyP => Some(ImeKeyExpect::Letter('p')),
+        KeyQ => Some(ImeKeyExpect::Letter('q')),
+        KeyR => Some(ImeKeyExpect::Letter('r')),
+        KeyS => Some(ImeKeyExpect::Letter('s')),
+        KeyT => Some(ImeKeyExpect::Letter('t')),
+        KeyU => Some(ImeKeyExpect::Letter('u')),
+        KeyV => Some(ImeKeyExpect::Letter('v')),
+        KeyW => Some(ImeKeyExpect::Letter('w')),
+        KeyX => Some(ImeKeyExpect::Letter('x')),
+        KeyY => Some(ImeKeyExpect::Letter('y')),
+        KeyZ => Some(ImeKeyExpect::Letter('z')),
+        Digit0 => Some(ImeKeyExpect::Char('0')),
+        Digit1 => Some(ImeKeyExpect::Char('1')),
+        Digit2 => Some(ImeKeyExpect::Char('2')),
+        Digit3 => Some(ImeKeyExpect::Char('3')),
+        Digit4 => Some(ImeKeyExpect::Char('4')),
+        Digit5 => Some(ImeKeyExpect::Char('5')),
+        Digit6 => Some(ImeKeyExpect::Char('6')),
+        Digit7 => Some(ImeKeyExpect::Char('7')),
+        Digit8 => Some(ImeKeyExpect::Char('8')),
+        Digit9 => Some(ImeKeyExpect::Char('9')),
+        Slash => Some(ImeKeyExpect::Char('/')),
+        _ => None,
+    }
+}
+
+/// macOS often delivers focused web controls' keys only as [`winit::event::Ime::Commit`], with no
+/// [`WindowEvent::KeyboardInput`] for Vimium to intercept (e.g. Google consent language button).
+pub fn chord_matches_winit_ime_char(
+    chord: &KeyChord,
+    mods: winit::keyboard::ModifiersState,
+    committed: char,
+) -> bool {
+    if chord.shift != mods.shift_key()
+        || chord.ctrl != mods.control_key()
+        || chord.alt != mods.alt_key()
+        || chord.cmd != mods.super_key()
+    {
+        return false;
+    }
+    let Some(expect) = key_code_ime_expect(chord.key) else {
+        return false;
+    };
+    match expect {
+        ImeKeyExpect::Letter(base) => {
+            if chord.shift {
+                committed == base.to_ascii_uppercase()
+            } else {
+                committed.to_ascii_lowercase() == base
+            }
+        }
+        ImeKeyExpect::Char(ch) => committed == ch,
+    }
+}
+
 fn settings_search_paths() -> Vec<PathBuf> {
     let mut out = vec![
         PathBuf::from("settings.toml"),
@@ -439,5 +575,52 @@ mod tests {
         let c = parse_key_chord("j").unwrap();
         assert!(!c.shift);
         assert_eq!(c.key, KeyCode::KeyJ);
+    }
+
+    #[test]
+    fn ime_char_matches_hint_f_without_keyboard_event() {
+        let chord = parse_key_chord("f").unwrap();
+        let mods = winit::keyboard::ModifiersState::default();
+        assert!(chord_matches_winit_ime_char(&chord, mods, 'f'));
+        assert!(chord_matches_winit_ime_char(&chord, mods, 'F'));
+        assert!(!chord_matches_winit_ime_char(&chord, mods, 'g'));
+    }
+
+    #[test]
+    fn chord_or_text_matches_f_when_physical_unidentified() {
+        use winit::keyboard::{Key, ModifiersState, NativeKeyCode, PhysicalKey};
+        let chord = parse_key_chord("f").unwrap();
+        let mods = ModifiersState::default();
+        let phys = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+        let logical = Key::Character("f".into());
+        assert!(chord_matches_winit_or_text(
+            &chord,
+            mods,
+            &phys,
+            Some("f"),
+            &logical
+        ));
+        assert!(chord_matches_winit_or_text(
+            &chord,
+            mods,
+            &phys,
+            None,
+            &logical
+        ));
+    }
+
+    #[test]
+    fn ime_char_matches_default_vimium_scroll_and_modes() {
+        let mods = winit::keyboard::ModifiersState::default();
+        let j = parse_key_chord("j").unwrap();
+        assert!(chord_matches_winit_ime_char(&j, mods, 'j'));
+
+        let slash = parse_key_chord("/").unwrap();
+        assert!(chord_matches_winit_ime_char(&slash, mods, '/'));
+
+        let mut shift = winit::keyboard::ModifiersState::default();
+        shift.set(winit::keyboard::ModifiersState::SHIFT, true);
+        let shift_n = parse_key_chord("shift+n").unwrap();
+        assert!(chord_matches_winit_ime_char(&shift_n, shift, 'N'));
     }
 }

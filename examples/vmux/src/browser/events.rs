@@ -12,8 +12,9 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use cef::rc::Rc;
 use cef::{
-    Browser, CefString, CefStringUtf16, CefStringUtf8, Domdocument, Domvisitor, Errorcode, Frame,
-    ImplBrowser, ImplBrowserHost, ImplDomdocument, ImplDomnode, ImplDomvisitor, ImplFrame,
+    Browser, CefString, CefStringList, CefStringUtf16, CefStringUtf8, Domdocument, Domvisitor,
+    Errorcode, Frame, ImplBrowser, ImplBrowserHost, ImplDomdocument, ImplDomnode, ImplDomvisitor,
+    ImplFrame,
     ImplNavigationEntry, ImplNavigationEntryVisitor, ImplTask, ImplView, ImplWindow, NavigationEntry,
     NavigationEntryVisitor, Task, ThreadId, WrapDomvisitor, WrapNavigationEntryVisitor, WrapTask,
     base64_encode, browser_host_get_browser_by_identifier, browser_view_get_for_browser,
@@ -168,10 +169,176 @@ impl fmt::Debug for LoadErrorBrowserCallbackEvent {
     }
 }
 
-const VMUX_LINK_HINTS_JS: &str = include_str!(concat!(
+const VMUX_LINK_HINTS_JS_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/resources/link_hints.js"
 ));
+const VMUX_LINK_HINTS_PRECOUNT_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/link_hints_precount.js"
+));
+
+fn vmux_link_hints_js_with_labels(label_start: usize, label_total: usize) -> String {
+    VMUX_LINK_HINTS_JS_TEMPLATE
+        .replace("__VMUX_LABEL_START__", &label_start.to_string())
+        .replace("__VMUX_LABEL_TOTAL__", &label_total.to_string())
+}
+
+/// Stable frame order for multi-frame hints (main + subframes, e.g. reCAPTCHA / consent iframes).
+pub(crate) fn browser_all_frames(browser: &Browser) -> Vec<Frame> {
+    let mut list = CefStringList::new();
+    browser.frame_identifiers(Some(&mut list));
+    let mut ids: Vec<String> = list.into_iter().collect();
+    ids.sort();
+    if !ids.is_empty() {
+        return ids
+            .into_iter()
+            .filter_map(|id| {
+                let cs = CefString::from(id.as_str());
+                browser.frame_by_identifier(Some(&cs))
+            })
+            .collect();
+    }
+    browser.main_frame().into_iter().collect()
+}
+
+const VMUX_BLUR_ACTIVE_ELEMENT_JS: &str = r#"try{var a=document.activeElement;if(a&&typeof a.blur==='function')a.blur();}catch(e){}"#;
+
+/// Blur `document.activeElement` in every frame (consent iframes / language `<button>` traps).
+/// Use **only** on explicit user actions (e.g. `f`, Esc), not on every scroll — repeated blur
+/// clears CEF focus and can break keyboard input.
+pub(crate) fn blur_active_element_all_frames(browser: &Browser) {
+    let url = CefString::from("vmux://blur-active-element");
+    let code = CefString::from(VMUX_BLUR_ACTIVE_ELEMENT_JS);
+    for frame in browser_all_frames(browser) {
+        frame.execute_java_script(Some(&code), Some(&url), 0);
+    }
+}
+
+fn link_hints_frame_list(browser: &Browser) -> Vec<Frame> {
+    browser_all_frames(browser)
+}
+
+wrap_domvisitor! {
+    struct HintPrecountReadVisitor {
+        out: Arc<Mutex<usize>>,
+    }
+
+    impl Domvisitor {
+        fn visit(&self, document: Option<&mut Domdocument>) {
+            let n = match document {
+                None => 0usize,
+                Some(doc) => doc
+                    .document()
+                    .map(|root| {
+                        let attr = CefString::from("data-vmux-hint-precount");
+                        if root.has_element_attribute(Some(&attr)) == 0 {
+                            return 0usize;
+                        }
+                        let raw = root.element_attribute(Some(&attr));
+                        let s = CefStringUtf8::from(&CefStringUtf16::from(&raw)).to_string();
+                        s.trim().parse::<usize>().unwrap_or(0)
+                    })
+                    .unwrap_or(0),
+            };
+            if let Ok(mut g) = self.out.lock() {
+                *g = n;
+            }
+        }
+    }
+}
+
+fn link_hints_precount_execute_on_frame(frame: &Frame) {
+    let code = CefString::from(VMUX_LINK_HINTS_PRECOUNT_JS);
+    let url = CefString::from("vmux://link-hints-precount");
+    frame.execute_java_script(Some(&code), Some(&url), 0);
+}
+
+fn link_hints_read_precount_on_frame(frame: &Frame) -> usize {
+    let out = Arc::new(Mutex::new(0usize));
+    let mut visitor = HintPrecountReadVisitor::new(Arc::clone(&out));
+    frame.visit_dom(Some(&mut visitor));
+    out.lock().ok().map(|g| *g).unwrap_or(0)
+}
+
+fn link_hints_show_execute(browser: &Browser, browser_id: i32, hub: &ForeignOsrIndex) {
+    // Drop focus traps (e.g. Google consent language control) so link hints can arm; do **not**
+    // call this from scroll — see module comment on [`blur_active_element_all_frames`].
+    blur_active_element_all_frames(browser);
+    crate::browser::backend::cef::pump::pump(4);
+    let mut frames = link_hints_frame_list(browser);
+    let mut wait = 0u32;
+    while frames.is_empty() && wait < 16 {
+        crate::browser::backend::cef::pump::pump(4);
+        frames = link_hints_frame_list(browser);
+        wait += 1;
+    }
+    if frames.is_empty() {
+        bevy_log::warn!(
+            target: "vmux",
+            pid = std::process::id(),
+            "link_hints_show_execute: no frames for browser_id={browser_id} after pump retries (page still loading?)"
+        );
+        return;
+    }
+    let mut counts: Vec<usize> = Vec::with_capacity(frames.len());
+    for f in &frames {
+        link_hints_precount_execute_on_frame(f);
+        crate::browser::backend::cef::pump::pump(4);
+        counts.push(link_hints_read_precount_on_frame(f));
+    }
+    let mut total: usize = counts.iter().sum();
+    // Cookie / consent UIs often live in a subframe that appears a few pumps after the main frame.
+    if total == 0 {
+        for _ in 0..6 {
+            crate::browser::backend::cef::pump::pump(12);
+            frames = link_hints_frame_list(browser);
+            if frames.is_empty() {
+                continue;
+            }
+            counts.clear();
+            counts.reserve(frames.len());
+            for f in &frames {
+                link_hints_precount_execute_on_frame(f);
+                crate::browser::backend::cef::pump::pump(6);
+                counts.push(link_hints_read_precount_on_frame(f));
+            }
+            total = counts.iter().sum();
+            if total > 0 {
+                break;
+            }
+        }
+    }
+    let mut label_start = 0usize;
+    let url = CefString::from("vmux://link-hints");
+    for (i, f) in frames.iter().enumerate() {
+        let c = counts[i];
+        if c == 0 {
+            continue;
+        }
+        let js = vmux_link_hints_js_with_labels(label_start, total);
+        let code = CefString::from(js.as_str());
+        f.execute_java_script(Some(&code), Some(&url), 0);
+        label_start += c;
+    }
+    crate::browser::backend::cef::pump::pump(8);
+    let _snap = link_hints_read_session_with_browser(browser);
+    request_window_redraw_for_browser(hub, browser_id);
+}
+
+const VMUX_LINK_HINTS_HIDE_JS: &str = concat!(
+    "try{document.documentElement.removeAttribute('data-vmux-hint-precount');}catch(e){}",
+    "try{window.__vmux_hints_cleanup&&window.__vmux_hints_cleanup();}catch(e){}",
+);
+
+fn link_hints_hide_execute(browser: &Browser) {
+    let frames = link_hints_frame_list(browser);
+    let code = CefString::from(VMUX_LINK_HINTS_HIDE_JS);
+    let url = CefString::from("vmux://link-hints-clear");
+    for f in frames {
+        f.execute_java_script(Some(&code), Some(&url), 0);
+    }
+}
 
 fn visible_navigation_url(browser: &Browser) -> Option<String> {
     let host = browser.host()?;
@@ -296,8 +463,10 @@ wrap_domvisitor! {
                     .unwrap_or((false, 1u8)),
             };
             if let Ok(mut g) = self.out.lock() {
-                g.still_active = active;
-                g.hint_label_width = width;
+                if active {
+                    g.still_active = true;
+                    g.hint_label_width = g.hint_label_width.max(width);
+                }
             }
         }
     }
@@ -588,15 +757,7 @@ pub fn apply_link_hints_show_browser_events_system(
             let Some(browser) = cef_browser_by_id(ev.browser_id) else {
                 continue;
             };
-            let Some(frame) = browser.main_frame().or_else(|| browser.focused_frame()) else {
-                continue;
-            };
-            let code = CefString::from(VMUX_LINK_HINTS_JS);
-            let url = CefString::from("vmux://link-hints");
-            frame.execute_java_script(Some(&code), Some(&url), 0);
-            crate::browser::backend::cef::pump::pump(8);
-            let _snap = link_hints_read_session_with_browser(&browser);
-            request_window_redraw_for_browser(hub.0.as_ref(), ev.browser_id);
+            link_hints_show_execute(&browser, ev.browser_id, hub.0.as_ref());
             continue;
         }
         let mut task = LinkHintsShowPerformOnUiTask::new(ev.browser_id);
@@ -619,14 +780,7 @@ pub fn apply_link_hints_hide_browser_events_system(
             let Some(browser) = cef_browser_by_id(ev.browser_id) else {
                 continue;
             };
-            let Some(frame) = browser.main_frame().or_else(|| browser.focused_frame()) else {
-                continue;
-            };
-            let code = CefString::from(
-                "try{window.__vmux_hints_cleanup&&window.__vmux_hints_cleanup();}catch(e){}",
-            );
-            let url = CefString::from("vmux://link-hints-clear");
-            frame.execute_java_script(Some(&code), Some(&url), 0);
+            link_hints_hide_execute(&browser);
             continue;
         }
         let mut task = LinkHintsHidePerformOnUiTask::new(ev.browser_id);
@@ -811,20 +965,26 @@ pub fn apply_loading_state_changed_browser_events_system(
             crate::browser::backend::cef::pump::pump(5);
             continue;
         }
-        if let Some(attach) = browser_cef_attach() {
-            let deferred = attach
-                .deferred_url_after_blank
-                .lock()
-                .ok()
-                .and_then(|mut m| m.remove(&browser_id));
-            if let Some(next_url) = deferred {
-                let mut task = DeferredStartupNavTask::new(browser_id, next_url.clone());
-                if post_task(ThreadId::UI, Some(&mut task)) == 0 {
-                    bevy_log::warn!(
-                        target: "vmux",
-                        pid = std::process::id(),
-                        "apply_loading_state_changed: post_task failed for deferred startup URL — sync load_url"
-                    );
+        // Staged startup: `about:blank` may finish before `deferred_url_after_blank` is inserted
+        // (attach runs later or loses same-tick ordering). [`apply_osr_browser_attach_system`] also
+        // posts this task after insert so the real `startup_url` always loads.
+        if browser_cef_attach().is_some() {
+            let mut task = ConsumeDeferredStartupNavTask::new(browser_id);
+            if post_task(ThreadId::UI, Some(&mut task)) == 0 {
+                bevy_log::warn!(
+                    target: "vmux",
+                    pid = std::process::id(),
+                    "apply_loading_state_changed: post_task failed for deferred startup URL — sync load_url"
+                );
+                let Some(attach) = browser_cef_attach() else {
+                    continue;
+                };
+                let next_url = attach
+                    .deferred_url_after_blank
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.remove(&browser_id));
+                if let Some(next_url) = next_url {
                     let u = CefString::from(next_url.as_str());
                     if let Some(frame) = browser.main_frame() {
                         frame.load_url(Some(&u));
@@ -962,6 +1122,28 @@ pub(crate) fn apply_osr_browser_attach_system(
         if let Some(next_url) = shell.deferred_url {
             if let Ok(mut m) = attach.deferred_url_after_blank.lock() {
                 m.insert(browser_id, next_url);
+            }
+            let mut task = ConsumeDeferredStartupNavTask::new(browser_id);
+            if post_task(ThreadId::UI, Some(&mut task)) == 0 {
+                bevy_log::warn!(
+                    target: "vmux",
+                    pid = std::process::id(),
+                    "apply_osr_browser_attach: post_task failed for deferred startup URL — sync load_url"
+                );
+                let next_url = attach
+                    .deferred_url_after_blank
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.remove(&browser_id));
+                if let Some(next_url) = next_url {
+                    let u = CefString::from(next_url.as_str());
+                    if let Some(browser) = cef_browser_by_id(browser_id) {
+                        if let Some(frame) = browser.main_frame() {
+                            frame.load_url(Some(&u));
+                        }
+                    }
+                    crate::browser::backend::cef::pump::pump(8);
+                }
             }
         }
         crate::browser::event_loop::send_user_event(
@@ -1151,14 +1333,28 @@ wrap_task! {
     impl Task {
         fn execute(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
-            crate::browser::event_loop::send_user_event(
-                crate::browser::event_loop::UserEvent::Vimium(
-                    crate::browser::event_loop::VimiumEvent::LinkHintsShowBrowser(
-                        LinkHintsShowBrowserEvent {
-                            browser_id: self.browser_id,
-                        },
-                    ),
-                ),
+            let Some(hub) = crate::browser::event_loop::try_foreign_osr_index() else {
+                bevy_log::warn!(
+                    target: "vmux",
+                    pid = std::process::id(),
+                    "LinkHintsShowPerformOnUiTask: foreign OSR index missing"
+                );
+                return;
+            };
+            for attempt in 0..32u32 {
+                if let Some(browser) = cef_browser_by_id(self.browser_id) {
+                    link_hints_show_execute(&browser, self.browser_id, hub.as_ref());
+                    return;
+                }
+                if attempt + 1 < 32 {
+                    crate::browser::backend::cef::pump::pump(2);
+                }
+            }
+            bevy_log::warn!(
+                target: "vmux",
+                pid = std::process::id(),
+                "LinkHintsShowPerformOnUiTask: no browser for browser_id={}",
+                self.browser_id
             );
         }
     }
@@ -1171,15 +1367,9 @@ wrap_task! {
     impl Task {
         fn execute(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
-            crate::browser::event_loop::send_user_event(
-                crate::browser::event_loop::UserEvent::Vimium(
-                    crate::browser::event_loop::VimiumEvent::LinkHintsHideBrowser(
-                        LinkHintsHideBrowserEvent {
-                            browser_id: self.browser_id,
-                        },
-                    ),
-                ),
-            );
+            if let Some(browser) = cef_browser_by_id(self.browser_id) {
+                link_hints_hide_execute(&browser);
+            }
         }
     }
 }
@@ -1359,16 +1549,15 @@ pub(crate) fn link_hints_feed_key_on_ui(
     let Some(browser) = cef_browser_by_id(browser_id) else {
         return LinkHintsFeedOutcome::default();
     };
-    let Some(frame) = browser.main_frame().or_else(|| browser.focused_frame()) else {
-        return LinkHintsFeedOutcome::default();
-    };
     let code = format!(
         "try{{if(typeof window.__vmux_hints_feed==='function')window.__vmux_hints_feed('{}');}}catch(e){{}}",
         ch
     );
     let code = CefString::from(code.as_str());
     let url = CefString::from("vmux://link-hints-feed");
-    frame.execute_java_script(Some(&code), Some(&url), 0);
+    for frame in link_hints_frame_list(&browser) {
+        frame.execute_java_script(Some(&code), Some(&url), 0);
+    }
     crate::browser::backend::cef::pump::pump(12);
     if let Some(h) = crate::browser::event_loop::try_foreign_osr_index() {
         request_window_redraw_for_browser(h.as_ref(), browser_id);
@@ -1377,15 +1566,24 @@ pub(crate) fn link_hints_feed_key_on_ui(
     link_hints_finalize_feed_outcome(snap, prior_typed_len)
 }
 
-fn link_hints_read_session_with_browser(browser: &Browser) -> LinkHintsFeedOutcome {
-    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+fn link_hints_read_session_on_frame(frame: &Frame) -> LinkHintsFeedOutcome {
     let out = Arc::new(Mutex::new(LinkHintsFeedOutcome::default()));
-    let Some(frame) = browser.main_frame().or_else(|| browser.focused_frame()) else {
-        return LinkHintsFeedOutcome::default();
-    };
     let mut visitor = LinkHintsSessionDomVisitor::new(Arc::clone(&out));
     frame.visit_dom(Some(&mut visitor));
     out.lock().ok().map(|g| g.clone()).unwrap_or_default()
+}
+
+fn link_hints_read_session_with_browser(browser: &Browser) -> LinkHintsFeedOutcome {
+    debug_assert_ne!(currently_on(ThreadId::UI), 0);
+    let mut merged = LinkHintsFeedOutcome::default();
+    for frame in link_hints_frame_list(browser) {
+        let snap = link_hints_read_session_on_frame(&frame);
+        if snap.still_active {
+            merged.still_active = true;
+            merged.hint_label_width = merged.hint_label_width.max(snap.hint_label_width);
+        }
+    }
+    merged
 }
 
 fn link_hints_read_session_on_ui(browser_id: i32) -> LinkHintsFeedOutcome {
@@ -1437,24 +1635,71 @@ wrap_task! {
     }
 }
 
+// Pop `deferred_url_after_blank` on the CEF UI thread and navigate (no-op if already consumed).
 wrap_task! {
-    struct DeferredStartupNavTask {
+    struct ConsumeDeferredStartupNavTask {
         browser_id: i32,
-        url: String,
     }
 
     impl Task {
         fn execute(&self) {
             debug_assert_ne!(currently_on(ThreadId::UI), 0);
+            let Some(attach) = browser_cef_attach() else {
+                return;
+            };
+            let next_url = attach
+                .deferred_url_after_blank
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&self.browser_id));
+            let Some(next_url) = next_url else {
+                return;
+            };
             let Some(browser) = cef_browser_by_id(self.browser_id) else {
                 return;
             };
-            let u = CefString::from(self.url.as_str());
+            let u = CefString::from(next_url.as_str());
             if let Some(frame) = browser.main_frame() {
                 frame.load_url(Some(&u));
             }
             crate::browser::backend::cef::pump::pump(8);
         }
+    }
+}
+
+#[cfg(test)]
+mod link_hints_label_tests {
+    #[test]
+    fn vmux_link_hints_js_replaces_label_placeholders() {
+        let s = super::vmux_link_hints_js_with_labels(7, 99);
+        assert!(
+            !s.contains("__VMUX_LABEL"),
+            "placeholders must be substituted: {s}"
+        );
+        assert!(s.contains('7') && s.contains("99"), "{s}");
+    }
+
+    #[test]
+    fn link_hints_scripts_pierce_shadow_dom() {
+        const PREC: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/resources/link_hints_precount.js"
+        ));
+        assert!(
+            PREC.contains("shadowRoot") && super::VMUX_LINK_HINTS_JS_TEMPLATE.contains("shadowRoot"),
+            "hint scan must recurse into shadow roots (e.g. google.com search UI)"
+        );
+    }
+
+    #[test]
+    fn link_hints_scripts_cover_google_consent_heuristics() {
+        const PREC: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/resources/link_hints_precount.js"
+        ));
+        assert!(PREC.contains("L2AGLb"), "common Google consent / search control id");
+        assert!(PREC.contains("data-testid^="), "Google uc-* data-testid pattern");
+        assert!(PREC.contains("countWithViewport"));
     }
 }
 

@@ -37,6 +37,7 @@ fn push_shutdown_event(app: &mut App) {
 /// Do not bail out when [`AppExitRequested`] is already true: a prior quit may have failed to close
 /// CEF browsers; retries must still emit [`RequestCloseAllBrowsersEvent`].
 fn apply_immediate_graceful_teardown(app: &mut App) {
+    crate::browser::renderer::osr_host::quit_feedback::try_begin_quit_visual_feedback();
     let has_browsers = app
         .world()
         .get_resource::<CefBrowserHandles>()

@@ -64,8 +64,11 @@ impl Plugin for BrowserPlugin {
                         events::apply_show_main_window_on_ui_events_system,
                         events::apply_close_all_browsers_on_ui_events_system
                             .after(handler_runtime::apply_close_all_browsers_requests_system),
-                        events::apply_link_hints_show_browser_events_system,
-                        events::apply_link_hints_hide_browser_events_system,
+                        events::apply_link_hints_show_browser_events_system
+                            .after(crate::window::pending_window_events::apply_osr_host_window_dispatches_system)
+                            .after(crate::vimium::apply_vimium_key_replay_events_system),
+                        events::apply_link_hints_hide_browser_events_system
+                            .after(crate::vimium::apply_vimium_key_replay_events_system),
                     ),
                     (
                         events::apply_link_hints_feed_key_deferred_browser_events_system,
@@ -75,12 +78,13 @@ impl Plugin for BrowserPlugin {
                             .before(handler_runtime::apply_close_all_browsers_requests_system),
                         events::apply_address_changed_browser_events_system,
                         events::apply_title_changed_browser_events_system,
-                        events::apply_loading_state_changed_browser_events_system,
                         (
                             events::enqueue_after_created_osr_attach_system,
                             events::apply_osr_browser_attach_system,
                         )
                             .chain(),
+                        events::apply_loading_state_changed_browser_events_system
+                            .after(events::apply_osr_browser_attach_system),
                         events::apply_before_close_browser_callback_events_system,
                         events::apply_do_close_browser_callback_events_system,
                         events::apply_load_error_browser_callback_events_system,

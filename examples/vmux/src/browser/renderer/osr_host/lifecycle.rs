@@ -25,7 +25,13 @@ const WINDOW_TITLE: &str = "vmux";
 const FORCE_QUIT_AFTER: Duration = Duration::from_millis(1200);
 
 impl OsrHostState {
-    /// Staged startup: load `about:blank` first for `http`/`https` targets (see `deferred_url_after_blank`).
+    /// Initial URL for `browser_host_create_browser` plus optional follow-up navigation.
+    ///
+    /// `http`/`https` startup URLs load **directly** so session history does not retain a leading
+    /// `about:blank` entry (Back would otherwise leave the user on a blank page).
+    ///
+    /// Empty config still uses `about:blank` first, then the default startup URL — same deferred
+    /// path as before (`deferred_url_after_blank`).
     pub fn staged_initial_navigation_url(startup_url: &str) -> (String, Option<String>) {
         let t = startup_url.trim();
         if t.is_empty() {
@@ -38,7 +44,7 @@ impl OsrHostState {
             return ("about:blank".to_string(), None);
         }
         if t.starts_with("http://") || t.starts_with("https://") {
-            return ("about:blank".to_string(), Some(t.to_string()));
+            return (t.to_string(), None);
         }
         (t.to_string(), None)
     }
@@ -517,5 +523,38 @@ impl OsrHostState {
         for p in &rt.pending_browser_hosts {
             p.surface.window.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod staged_initial_navigation_url_tests {
+    use super::OsrHostState;
+
+    #[test]
+    fn https_loads_directly_without_blank_history_staging() {
+        let (u, d) = OsrHostState::staged_initial_navigation_url("https://www.google.com");
+        assert_eq!(u, "https://www.google.com");
+        assert!(d.is_none());
+    }
+
+    #[test]
+    fn http_loads_directly() {
+        let (u, d) = OsrHostState::staged_initial_navigation_url("http://example.com/");
+        assert_eq!(u, "http://example.com/");
+        assert!(d.is_none());
+    }
+
+    #[test]
+    fn explicit_about_blank_no_deferred() {
+        let (u, d) = OsrHostState::staged_initial_navigation_url("about:blank");
+        assert_eq!(u, "about:blank");
+        assert!(d.is_none());
+    }
+
+    #[test]
+    fn whitespace_falls_back_to_blank_plus_default() {
+        let (u, d) = OsrHostState::staged_initial_navigation_url("   ");
+        assert_eq!(u, "about:blank");
+        assert_eq!(d.as_deref(), Some(crate::settings::DEFAULT_STARTUP_URL));
     }
 }

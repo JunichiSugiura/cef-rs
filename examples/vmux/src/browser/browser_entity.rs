@@ -201,7 +201,9 @@ pub fn apply_browser_spawn_events(
                 cef_browser: CefBrowserHandle(ev.browser.clone()),
                 osr_view_logical_size: osr_size,
                 osr_paint_bind_group: osr_bind,
-                editable_focus_hint: EditableFocusHint::default(),
+                // Optimistic "browse" until a probe / UI path updates. Avoids Vimium seeing `None`
+                // when `SetEditableFocusHint` from CEF was applied before this entity existed.
+                editable_focus_hint: EditableFocusHint(Some(false)),
                 link_hints_label_width: LinkHintsLabelWidth::default(),
                 last_address_url: LastAddressUrl::default(),
             })

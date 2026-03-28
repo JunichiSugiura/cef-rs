@@ -1,7 +1,7 @@
 use cef::*;
 use cef::sys::cef_event_flags_t;
 use winit::event::ElementState;
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, PhysicalKey};
 
 pub fn update_mods_from_winit(m: winit::keyboard::ModifiersState) -> cef_event_flags_t {
     let mut flags = cef_event_flags_t::EVENTFLAG_NONE;
@@ -189,6 +189,43 @@ pub fn lowercase_letter_from_physical(physical: &PhysicalKey) -> Option<char> {
         KeyCode::KeyY => Some('y'),
         KeyCode::KeyZ => Some('z'),
         _ => None,
+    }
+}
+
+/// Link-hint label character: physical letter keys, or a single `text` / `logical_key` character
+/// when macOS reports [`PhysicalKey::Unidentified`] for focused web controls (digits allowed).
+pub fn hint_label_char_from_key_event(event: &winit::event::KeyEvent) -> Option<char> {
+    if let Some(ch) = lowercase_letter_from_physical(&event.physical_key) {
+        return Some(ch);
+    }
+    let ch = event
+        .text
+        .as_ref()
+        .and_then(|t| {
+            let mut it = t.chars();
+            let c = it.next()?;
+            if it.next().is_some() {
+                return None;
+            }
+            Some(c)
+        })
+        .or_else(|| match &event.logical_key {
+            Key::Character(s) => {
+                let mut it = s.chars();
+                let c = it.next()?;
+                if it.next().is_some() {
+                    return None;
+                }
+                Some(c)
+            }
+            _ => None,
+        })?;
+    if ch.is_ascii_alphabetic() {
+        Some(ch.to_ascii_lowercase())
+    } else if ch.is_ascii_digit() {
+        Some(ch)
+    } else {
+        None
     }
 }
 

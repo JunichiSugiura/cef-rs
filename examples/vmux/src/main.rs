@@ -58,6 +58,7 @@ fn main() -> Result<(), &'static str> {
         pid = std::process::id(),
         "main: start"
     );
+    crate::vimium::input_trace::log_startup_notice();
     let _library = browser::backend::cef::bootstrap::load_cef();
     crate::lifecycle_trace::record_startup_milestone("main_after_load_cef");
     crate::lifecycle_trace::trace("main_after_load_cef");

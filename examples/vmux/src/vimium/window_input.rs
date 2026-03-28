@@ -2,6 +2,7 @@
 //! Lives under the top-level [`crate::vimium`] module; consumed by [`crate::window::dispatch`]
 //! and [`crate::vimium::VimiumPlugin`] systems.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bevy_ecs::entity::Entity;
@@ -11,12 +12,14 @@ use winit::window::WindowId;
 
 use crate::vimium;
 use crate::vimium::{VimiumChromeCleanup, VimiumState};
-use crate::settings::chord_matches_winit;
+use crate::settings::{
+    chord_matches_winit, chord_matches_winit_ime_char, chord_matches_winit_or_text,
+};
 
 use crate::browser::events::{
-    ArmWindowlessCloseBrowserEvent, LinkHintsFeedKeyDeferredBrowserEvent, LinkHintsHideBrowserEvent,
-    LinkHintsShowBrowserEvent, NavigateBrowserEvent, QuitCloseAllBrowsersBrowserEvent,
-    ReloadBrowserEvent,
+    blur_active_element_all_frames, ArmWindowlessCloseBrowserEvent,
+    LinkHintsFeedKeyDeferredBrowserEvent, LinkHintsHideBrowserEvent, LinkHintsShowBrowserEvent,
+    NavigateBrowserEvent, QuitCloseAllBrowsersBrowserEvent, ReloadBrowserEvent,
 };
 use crate::browser::editable_focus as editable_focus;
 use crate::browser::event_loop::RuntimeState;
@@ -25,6 +28,47 @@ use crate::browser::renderer::input::keyboard;
 use crate::browser::event_loop::{LinkHintFeedEvent, VimiumKeyReplayEvent};
 use crate::vimium::editable_gating::{self as editable_gating, EditableFocusSnapshot};
 use crate::browser::renderer::osr_host::state::OsrHostState;
+
+/// OSR [`windows_store`] is keyed by [`WindowId`]; on the first frames after attach, ECS may already
+/// know `browser_id` while `get(window_id)` still misses. Vimium replay then must not drop deferred
+/// keys — fall back to [`crate::browser::events::cef_browser_by_id`].
+fn browser_for_vimium_target(
+    osr_host: &OsrHostState,
+    window_id: WindowId,
+    browser_id: i32,
+) -> Option<cef::Browser> {
+    osr_host
+        .browser_for_window(window_id)
+        .or_else(|| crate::browser::events::cef_browser_by_id(browser_id))
+}
+
+/// Consent / language controls can keep DOM focus on a `<button>`; blur once so Esc / vimium work.
+/// Does not run in insert / find / visual / link-hints modes. Caller still forwards keys to CEF if needed.
+fn blur_trapped_dom_focus_browse_mode(
+    osr_host: &mut OsrHostState,
+    window_id: WindowId,
+    bid: i32,
+    vim: &VimiumState,
+) {
+    if vim.link_hints_active() || vim.is_insert(bid) || vim.is_find(bid) || vim.is_visual(bid) {
+        return;
+    }
+    let Some(b) = browser_for_vimium_target(osr_host, window_id, bid) else {
+        return;
+    };
+    blur_active_element_all_frames(&b);
+    enqueue_browser_ui_op(
+        &osr_host.browser_ui_ops,
+        BrowserUiOp::InvalidateEditableFocusHint {
+            browser_id: bid,
+        },
+    );
+    editable_focus::enqueue_probe_request(
+        &osr_host.editable_focus_queues.pending_probes,
+        bid,
+    );
+    osr_host.nudge_osr_view_after_input(window_id);
+}
 
 #[derive(Default)]
 pub(crate) struct BrowserEventBatch {
@@ -313,6 +357,7 @@ pub(crate) fn try_handle_vimium_keys_after_editable_probe(
     vim: &mut VimiumState,
     window_id: WindowId,
     event: &winit::event::KeyEvent,
+    ecs_browser: Option<(Entity, i32)>,
     editable_focus: &EditableFocusSnapshot,
     out: &mut BrowserEventBatch,
 ) -> bool {
@@ -323,10 +368,375 @@ pub(crate) fn try_handle_vimium_keys_after_editable_probe(
         window_id,
         event,
         true,
-        None,
+        ecs_browser,
         editable_focus,
         out,
     )
+}
+
+/// macOS: focused web nodes (e.g. Google consent language control) often emit `Ime::Commit` without
+/// a matching `KeyboardInput`, so vimium never sees the key. Mirror
+/// [`try_handle_vimium_keys_inner`] for **single-character** commits representable via
+/// [`chord_matches_winit_ime_char`]. Caller must pass a **resolved** `browser_id` and must **not**
+/// hold `windows_store` locked (see `nudge_osr_view_after_input`).
+pub(crate) fn try_handle_vimium_ime_commit(
+    osr_host: &mut OsrHostState,
+    rt: &mut RuntimeState,
+    vim: &mut VimiumState,
+    window_id: WindowId,
+    browser_id: i32,
+    text: &str,
+    editable_focus: &EditableFocusSnapshot,
+    out: &mut BrowserEventBatch,
+) -> bool {
+    let km = &*osr_host.key_settings;
+    let bid = browser_id;
+    if !km.enabled {
+        if super::input_trace::enabled() {
+            bevy_log::info!(
+                target: "vmux",
+                pid = std::process::id(),
+                bid,
+                "vimium_input: ime_commit skipped (vimium disabled in settings)",
+            );
+        }
+        return false;
+    }
+
+    let text = text.trim();
+    let mut chars = text.chars();
+    let Some(c0) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        if super::input_trace::enabled() {
+            bevy_log::info!(
+                target: "vmux",
+                pid = std::process::id(),
+                bid,
+                trimmed = ?text,
+                "vimium_input: ime_commit rejected (multi-codepoint after trim; vimium IME path is single-char only)",
+            );
+        }
+        return false;
+    }
+
+    let now = Instant::now();
+
+    if let Some(hid_bid) = vim.expire_link_hints_if_due(now) {
+        out.link_hints_hide.push(LinkHintsHideBrowserEvent {
+            browser_id: hid_bid,
+        });
+        osr_host.nudge_osr_view_after_input(window_id);
+    }
+
+    let mods = rt.mods_winit;
+    let mod_ctrl = mods.control_key();
+    let mod_cmd = mods.super_key();
+    let mod_alt = mods.alt_key();
+    let no_ctrl_alt_cmd = !mod_ctrl && !mod_alt && !mod_cmd;
+
+    // Match `try_handle_vimium_keys_inner` link-hints UX: dismiss on non-hint keys / IME Esc;
+    // feed plain ASCII alphanumerics as hint characters (labels can use digits).
+    if vim.link_hints_active() && vim.link_hints_browser_id() == Some(bid) {
+        let is_hint_letter = c0.is_ascii_alphanumeric();
+        let esc = c0 == '\u{1b}';
+
+        if !(is_hint_letter && no_ctrl_alt_cmd) {
+            if !editable_gating::may_handle_history_shortcuts(editable_focus, bid) {
+                out.link_hints_hide.push(LinkHintsHideBrowserEvent { browser_id: bid });
+                vim.clear_link_hints();
+                osr_host.nudge_osr_view_after_input(window_id);
+            }
+        }
+
+        if !vim.link_hints_active() {
+            return false;
+        }
+
+        if esc && no_ctrl_alt_cmd {
+            out.link_hints_hide.push(LinkHintsHideBrowserEvent { browser_id: bid });
+            vim.clear_link_hints();
+            osr_host.nudge_osr_view_after_input(window_id);
+            return true;
+        }
+
+        if is_hint_letter && no_ctrl_alt_cmd {
+            let ch = c0.to_ascii_lowercase();
+            let prior = vim.link_hints_typed_prefix().len();
+            out.link_hints_feed_key_deferred.push(LinkHintsFeedKeyDeferredBrowserEvent {
+                browser_id: bid,
+                ch,
+                prior_typed_len: prior,
+            });
+            return true;
+        }
+
+        return false;
+    }
+
+    let window_ms = km.scroll_top_double_press_ms;
+    if let Some(prev) = vim.scroll_g_pending {
+        if now.duration_since(prev) > Duration::from_millis(window_ms) {
+            vim.scroll_g_pending = None;
+        }
+    }
+
+    if vim.is_insert(bid) || vim.is_find(bid) || vim.is_visual(bid) {
+        return false;
+    }
+
+    if c0 == '\u{1b}' && no_ctrl_alt_cmd {
+        blur_trapped_dom_focus_browse_mode(osr_host, window_id, bid, vim);
+        return false;
+    }
+
+    if let Some(ref chord) = km.hint_links {
+        if chord_matches_winit_ime_char(chord, mods, c0) {
+            out.link_hints_show.push(LinkHintsShowBrowserEvent { browser_id: bid });
+            vim.arm_link_hints(bid, now);
+            osr_host.nudge_osr_view_after_input(window_id);
+            return true;
+        }
+    }
+
+    if let Some(ref chord) = km.history_back {
+        if chord_matches_winit_ime_char(chord, mods, c0) {
+            if editable_gating::may_handle_history_shortcuts(editable_focus, bid) {
+                vim.scroll_g_pending = None;
+                osr_host.request_set_active_browser(bid);
+                out.navigate.push(NavigateBrowserEvent {
+                    browser_id: bid,
+                    go_forward: false,
+                });
+                return true;
+            }
+            return false;
+        }
+    }
+    if let Some(ref chord) = km.history_forward {
+        if chord_matches_winit_ime_char(chord, mods, c0) {
+            if editable_gating::may_handle_history_shortcuts(editable_focus, bid) {
+                vim.scroll_g_pending = None;
+                osr_host.request_set_active_browser(bid);
+                out.navigate.push(NavigateBrowserEvent {
+                    browser_id: bid,
+                    go_forward: true,
+                });
+                return true;
+            }
+            return false;
+        }
+    }
+
+    if let Some(browser) = browser_for_vimium_target(osr_host, window_id, bid) {
+        if !vim.find_committed.is_empty() {
+            if let Some(ref chord) = km.find_next {
+                if chord_matches_winit_ime_char(chord, mods, c0) {
+                    if editable_gating::editable_focus_is_typing(editable_focus, bid) {
+                        return false;
+                    }
+                    vim.scroll_g_pending = None;
+                    vimium::modes::cef_find(&browser, &vim.find_committed, true, true);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                    return true;
+                }
+            }
+            if let Some(ref chord) = km.find_prev {
+                if chord_matches_winit_ime_char(chord, mods, c0) {
+                    if editable_gating::editable_focus_is_typing(editable_focus, bid) {
+                        return false;
+                    }
+                    vim.scroll_g_pending = None;
+                    vimium::modes::cef_find(&browser, &vim.find_committed, false, true);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                    return true;
+                }
+            }
+        }
+    }
+
+    let might_mode_chord = [
+        km.mode_insert.as_ref(),
+        km.mode_find_open.as_ref(),
+        km.mode_visual.as_ref(),
+        km.yank_url.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|c| chord_matches_winit_ime_char(c, mods, c0));
+
+    if might_mode_chord {
+        let page_ok_modes = true;
+        if let Some(browser) = browser_for_vimium_target(osr_host, window_id, bid) {
+            if let Some(ref chord) = km.mode_insert {
+                if chord_matches_winit_ime_char(chord, mods, c0) && page_ok_modes {
+                    clear_vimium_ux_if_other_browser(osr_host, vim, bid);
+                    teardown_vimium_ux_at_window_keep_committed(osr_host, vim, window_id, bid);
+                    vim.enter_insert(bid);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                    return true;
+                }
+            }
+            if let Some(ref chord) = km.mode_find_open {
+                if chord_matches_winit_ime_char(chord, mods, c0) && page_ok_modes {
+                    clear_vimium_ux_if_other_browser(osr_host, vim, bid);
+                    teardown_vimium_ux_at_window_keep_committed(osr_host, vim, window_id, bid);
+                    vim.enter_find(bid);
+                    vimium::modes::find_ui_show(&browser);
+                    vimium::modes::find_ui_set_query(&browser, "");
+                    osr_host.nudge_osr_view_after_input(window_id);
+                    return true;
+                }
+            }
+            if let Some(ref chord) = km.mode_visual {
+                if chord_matches_winit_ime_char(chord, mods, c0)
+                    && page_ok_modes
+                    && !rt.primary_mouse_down
+                    && !vim.link_hints_active()
+                {
+                    clear_vimium_ux_if_other_browser(osr_host, vim, bid);
+                    teardown_vimium_ux_at_window_keep_committed(osr_host, vim, window_id, bid);
+                    vim.enter_visual(bid);
+                    vimium::modes::visual_hint_show(&browser);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                    return true;
+                }
+            }
+            if let Some(ref chord) = km.yank_url {
+                if chord_matches_winit_ime_char(chord, mods, c0) && page_ok_modes {
+                    vim.scroll_g_pending = None;
+                    vimium::modes::yank_page_url(&browser);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                    return true;
+                }
+            }
+        }
+    }
+
+    let matches_vimium_content = [
+        km.scroll_line_down.as_ref(),
+        km.scroll_line_up.as_ref(),
+        km.scroll_page_down.as_ref(),
+        km.scroll_page_up.as_ref(),
+        km.scroll_bottom.as_ref(),
+        km.reload.as_ref(),
+        km.scroll_top_prefix.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|c| chord_matches_winit_ime_char(c, mods, c0));
+
+    let page_ok = matches_vimium_content;
+
+    if let Some(browser) = browser_for_vimium_target(osr_host, window_id, bid) {
+        if let Some(ref chord) = km.scroll_line_down {
+            if chord_matches_winit_ime_char(chord, mods, c0) {
+                if page_ok {
+                    vim.scroll_g_pending = None;
+                    vimium::scroll::scroll_line_down(&browser);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                }
+                return page_ok;
+            }
+        }
+        if let Some(ref chord) = km.scroll_line_up {
+            if chord_matches_winit_ime_char(chord, mods, c0) {
+                if page_ok {
+                    vim.scroll_g_pending = None;
+                    vimium::scroll::scroll_line_up(&browser);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                }
+                return page_ok;
+            }
+        }
+        if let Some(ref chord) = km.scroll_page_down {
+            if chord_matches_winit_ime_char(chord, mods, c0) {
+                if page_ok {
+                    vim.scroll_g_pending = None;
+                    vimium::scroll::scroll_page_down(&browser);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                }
+                return page_ok;
+            }
+        }
+        if let Some(ref chord) = km.scroll_page_up {
+            if chord_matches_winit_ime_char(chord, mods, c0) {
+                if page_ok {
+                    vim.scroll_g_pending = None;
+                    vimium::scroll::scroll_page_up(&browser);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                }
+                return page_ok;
+            }
+        }
+        if let Some(ref chord) = km.scroll_bottom {
+            if chord_matches_winit_ime_char(chord, mods, c0) {
+                if page_ok {
+                    vim.scroll_g_pending = None;
+                    vimium::scroll::scroll_bottom(&browser);
+                    osr_host.nudge_osr_view_after_input(window_id);
+                }
+                return page_ok;
+            }
+        }
+        if let Some(ref chord) = km.reload {
+            if chord_matches_winit_ime_char(chord, mods, c0) {
+                if page_ok {
+                    vim.scroll_g_pending = None;
+                    osr_host.request_set_active_browser(bid);
+                    out.reload.push(ReloadBrowserEvent { browser_id: bid });
+                }
+                return page_ok;
+            }
+        }
+
+        if let Some(ref prefix) = km.scroll_top_prefix {
+            if chord_matches_winit_ime_char(prefix, mods, c0) {
+                if !page_ok {
+                    return false;
+                }
+                if let Some(prev) = vim.scroll_g_pending {
+                    if now.duration_since(prev) <= Duration::from_millis(window_ms) {
+                        vim.scroll_g_pending = None;
+                        vimium::scroll::scroll_top(&browser);
+                        osr_host.nudge_osr_view_after_input(window_id);
+                        return true;
+                    }
+                }
+                vim.scroll_g_pending = Some(now);
+                return true;
+            }
+        }
+    }
+
+    let prefix_matches = km
+        .scroll_top_prefix
+        .as_ref()
+        .is_some_and(|p| chord_matches_winit_ime_char(p, mods, c0));
+    if !prefix_matches {
+        vim.scroll_g_pending = None;
+    }
+
+    if super::input_trace::enabled() {
+        let browser_resolved = browser_for_vimium_target(osr_host, window_id, bid).is_some();
+        bevy_log::info!(
+            target: "vmux",
+            pid = std::process::id(),
+            bid,
+            char = ?c0,
+            browser_resolved,
+            shift = mods.shift_key(),
+            ctrl = mods.control_key(),
+            alt = mods.alt_key(),
+            cmd = mods.super_key(),
+            may_history_shortcuts = editable_gating::may_handle_history_shortcuts(editable_focus, bid),
+            editable_probe_typing = editable_gating::editable_focus_is_typing(editable_focus, bid),
+            "vimium_input: ime_commit no matcher (will fall through to send_char unless swallowed)",
+        );
+    }
+
+    false
 }
 
 /// `editable_hint_fresh`: editable-focus DOM probe has just run; skip scheduling another probe before branching.
@@ -341,7 +751,7 @@ pub(crate) fn try_handle_vimium_keys_inner(
     editable_focus: &EditableFocusSnapshot,
     out: &mut BrowserEventBatch,
 ) -> bool {
-    let km = &*osr_host.key_settings;
+    let km = Arc::clone(&osr_host.key_settings);
     let Some(bid) = osr_host.browser_id_for_window(window_id, ecs_browser) else {
         return false;
     };
@@ -376,7 +786,6 @@ pub(crate) fn try_handle_vimium_keys_inner(
     let mod_ctrl = chord_mods.control_key();
     let mod_alt = chord_mods.alt_key();
     let mod_cmd = chord_mods.super_key();
-    let letter_press_no_winit_text = keyboard::physical_letter_press_without_winit_text(event);
     let key_sends_printable_text = keyboard::keyevent_has_printable_text(event);
     let now = Instant::now();
 
@@ -390,7 +799,7 @@ pub(crate) fn try_handle_vimium_keys_inner(
     // `LinkHints`: when typing the hint letters themselves we must NOT dismiss based on
     // "editable focus" probes, otherwise hints can disappear without activating a target.
     if vim.link_hints_active() {
-        let is_hint_letter = keyboard::lowercase_letter_from_physical(physical).is_some();
+        let is_hint_letter = keyboard::hint_label_char_from_key_event(event).is_some();
         let esc = match physical {
             PhysicalKey::Code(KeyCode::Escape) => true,
             _ => false,
@@ -459,7 +868,7 @@ pub(crate) fn try_handle_vimium_keys_inner(
         };
         let no_mod = !mod_ctrl && !mod_cmd && !mod_alt && !mod_shift;
         if esc && no_mod {
-            if let Some(b) = osr_host.browser_for_window(window_id) {
+            if let Some(b) = browser_for_vimium_target(osr_host, window_id, bid) {
                 vimium::modes::visual_hint_hide(&b);
             }
             vim.exit_ux_to_browse();
@@ -470,7 +879,7 @@ pub(crate) fn try_handle_vimium_keys_inner(
         if y_plain {
             match physical {
                 PhysicalKey::Code(KeyCode::KeyY) => {
-                    if let Some(b) = osr_host.browser_for_window(window_id) {
+                    if let Some(b) = browser_for_vimium_target(osr_host, window_id, bid) {
                         vimium::modes::yank_selection(&b);
                         osr_host.nudge_osr_view_after_input(window_id);
                     }
@@ -482,25 +891,30 @@ pub(crate) fn try_handle_vimium_keys_inner(
         return false;
     }
 
+    // Browse: blur trapped consent / language focus so Esc can dismiss UI and keys aren't stuck on FR.
+    // Still return false so CEF receives the Escape key event as well.
+    if matches!(physical, PhysicalKey::Code(KeyCode::Escape)) && !mod_ctrl && !mod_alt && !mod_cmd {
+        blur_trapped_dom_focus_browse_mode(osr_host, window_id, bid, vim);
+    }
+
     // Link hints (`f`): before the printable-text bail (winit sets `text` on letter keys).
     //
-    // - `may_handle_history_shortcuts`: block when probe/IME says **sure** text focus.
-    // - First keydown uses `!editable_hint_fresh` → defer + DOM probe, then replay once.
-    // - After replay, require `vimium_keys_safe_for_page` (probe **sure** not in an editable)
-    //   before arming — avoids (a) an infinite defer loop when the hint never becomes
-    //   `Some(false)`, and (b) arming hints while Google's search box has focus but the probe
-    //   still said "page" for a moment. If we're not sure, pass `f` to the page.
+    // Do **not** gate on editable-focus the way scroll keys do: home pages (e.g. Google) often
+    // autofocus the search `<input>` and the DOM probe reports `Some(true)`, which would block `f`
+    // forever. Arming hints steals `f` from the page until Esc — same trade-off as real Vimium
+    // when you invoke hints from a focused field.
+    //
+    // Do **not** defer through the editable-probe + `VimiumKeyReplayEvent` path: that async chain
+    // races the first paint (frames/browser handles not ready, hint-show running before replay).
+    // `f` does not need a fresh probe for routing — show/hide and JS overlay stand alone.
     if let Some(ref chord) = km.hint_links {
-        if chord_matches_winit(chord, chord_mods, physical) {
-            if !editable_gating::may_handle_history_shortcuts(editable_focus, bid) {
-                return false;
-            }
-            if !editable_hint_fresh {
-                return defer_vimium_key_after_editable_probe(osr_host, window_id, bid, event);
-            }
-            if !editable_gating::page_allows_app_shortcuts(editable_focus, bid) {
-                return false;
-            }
+        if chord_matches_winit_or_text(
+            chord,
+            chord_mods,
+            physical,
+            event.text.as_deref(),
+            &event.logical_key,
+        ) {
             out.link_hints_show.push(LinkHintsShowBrowserEvent { browser_id: bid });
             vim.arm_link_hints(bid, now);
             osr_host.nudge_osr_view_after_input(window_id);
@@ -508,23 +922,22 @@ pub(crate) fn try_handle_vimium_keys_inner(
         }
     }
 
-    // Browse: when the hint says focus is in a text control, pass unmodified keys to CEF.
-    // Do **not** use `KeyEvent::text` here — winit sets it for almost every letter (`j`/`k`/…),
-    // which would block all vimium scrolling. Printable-text guarding is applied only where needed
-    // (e.g. find-next/prev) and inside `page_ok` via `letter_press_no_winit_text` for IME.
-    {
-        let plain = !mod_ctrl && !mod_cmd && !mod_alt;
-        if plain && editable_gating::editable_focus_is_typing(editable_focus, bid) {
-            return false;
-        }
-    }
+    // Do **not** bail out globally when the probe says "typing": Google and similar pages autofocus
+    // a search `<input>` and we'd never run scroll / mode chords below (`j`/`k`/`d`/… would only
+    // reach CEF). Vimium-style UX here prefers capturing those bindings; use **insert mode** (`i`)
+    // when you need to type into the field. Find-next/prev still use `key_sends_printable_text`.
+    //
+    // Scroll/mode `page_ok` intentionally ignores `KeyEvent::text` / IME heuristics: on macOS the
+    // first key events after a tab loads often have **empty** `text` while still being real
+    // physical letter keys, so `physical_letter_press_without_winit_text` stayed true and blocked
+    // j/k/f until something (focus churn, navigation) started populating `text`.
 
+    // History: use `may_handle_history_shortcuts` (block only when probe is **sure** we're in a text
+    // control), not `page_allows_app_shortcuts` — otherwise Shift+H/L never run until the probe
+    // reports explicit “not editable”, unlike Cmd+[ / Alt+←→ in `window::dispatch`.
     if let Some(ref chord) = km.history_back {
         if chord_matches_winit(chord, chord_mods, physical) {
-            if !editable_hint_fresh {
-                return defer_vimium_key_after_editable_probe(osr_host, window_id, bid, event);
-            }
-            if editable_gating::page_allows_app_shortcuts(editable_focus, bid) {
+            if editable_gating::may_handle_history_shortcuts(editable_focus, bid) {
                 vim.scroll_g_pending = None;
                 osr_host.request_set_active_browser(bid);
                 out.navigate.push(NavigateBrowserEvent {
@@ -538,10 +951,7 @@ pub(crate) fn try_handle_vimium_keys_inner(
     }
     if let Some(ref chord) = km.history_forward {
         if chord_matches_winit(chord, chord_mods, physical) {
-            if !editable_hint_fresh {
-                return defer_vimium_key_after_editable_probe(osr_host, window_id, bid, event);
-            }
-            if editable_gating::page_allows_app_shortcuts(editable_focus, bid) {
+            if editable_gating::may_handle_history_shortcuts(editable_focus, bid) {
                 vim.scroll_g_pending = None;
                 osr_host.request_set_active_browser(bid);
                 out.navigate.push(NavigateBrowserEvent {
@@ -554,7 +964,7 @@ pub(crate) fn try_handle_vimium_keys_inner(
         }
     }
 
-    if let Some(browser) = osr_host.browser_for_window(window_id) {
+    if let Some(browser) = browser_for_vimium_target(osr_host, window_id, bid) {
         if !vim.find_committed.is_empty() {
             if let Some(ref chord) = km.find_next {
                 if chord_matches_winit(chord, chord_mods, physical) {
@@ -598,15 +1008,11 @@ pub(crate) fn try_handle_vimium_keys_inner(
     .any(|c| chord_matches_winit(c, chord_mods, physical));
 
     if might_mode_chord {
-        if !editable_hint_fresh {
-            return defer_vimium_key_after_editable_probe(osr_host, window_id, bid, event);
-        }
-        // When `text` is missing, the real character may arrive only via `Ime::Commit`; do not
-        // trust a stale "not editable" probe for mode chords (same class of bug as `d`/`g`/`r`).
-        let page_ok_modes =
-            editable_gating::page_allows_app_shortcuts(editable_focus, bid) && !letter_press_no_winit_text;
+        // Omit `page_allows_app_shortcuts` (Google autofocus) and empty-`text` IME heuristics so
+        // `/` / `i` / … work on first paint (see module comment above).
+        let page_ok_modes = true;
 
-        if let Some(browser) = osr_host.browser_for_window(window_id) {
+        if let Some(browser) = browser_for_vimium_target(osr_host, window_id, bid) {
             if let Some(ref chord) = km.mode_insert {
                 if chord_matches_winit(chord, chord_mods, physical) && page_ok_modes {
                         clear_vimium_ux_if_other_browser(osr_host, vim, bid);
@@ -665,15 +1071,8 @@ pub(crate) fn try_handle_vimium_keys_inner(
     .flatten()
     .any(|c| chord_matches_winit(c, chord_mods, physical));
 
-    let page_ok = if matches_vimium_content {
-        if !editable_hint_fresh {
-            return defer_vimium_key_after_editable_probe(osr_host, window_id, bid, event);
-        }
-        editable_gating::page_allows_app_shortcuts(editable_focus, bid) && !letter_press_no_winit_text
-    } else {
-        false
-    };
-    if let Some(browser) = osr_host.browser_for_window(window_id) {
+    let page_ok = matches_vimium_content;
+    if let Some(browser) = browser_for_vimium_target(osr_host, window_id, bid) {
         if let Some(ref chord) = km.scroll_line_down {
             if chord_matches_winit(chord, chord_mods, physical) {
                 if page_ok {
@@ -770,6 +1169,7 @@ pub(crate) fn handle_vimium_key_replay_event(
     rt: &mut RuntimeState,
     vim: &mut VimiumState,
     event: VimiumKeyReplayEvent,
+    ecs_browser: Option<(Entity, i32)>,
     editable_focus: &EditableFocusSnapshot,
     out: &mut BrowserEventBatch,
 ) {
@@ -779,6 +1179,7 @@ pub(crate) fn handle_vimium_key_replay_event(
         vim,
         event.window_id,
         &event.event,
+        ecs_browser,
         editable_focus,
         out,
     );

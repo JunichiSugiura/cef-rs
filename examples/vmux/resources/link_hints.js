@@ -3,8 +3,10 @@
    While a multi-letter code is still possible, all badges stay bright; only dim non-matches
    when every remaining candidate is a single-letter resolve (vmux-hint-nomatch).
    Only `data-vmux-hints` on <html> marks an active session; its value is the fixed label width (1, 2, …)
-   so the shell can continue the session when a DOM read lags after a key. */
-(function () {
+   so the shell can continue the session when a DOM read lags after a key.
+   `labelStart` / `labelTotal` come from the shell so subframes (e.g. reCAPTCHA) share one global
+   hint namespace with the main document. */
+(function (labelStart, labelTotal) {
   var letters = "abcdefghijklmnopqrstuvwxyz";
 
   var prev = window.__vmux_hints_cleanup;
@@ -14,20 +16,75 @@
     } catch (e) {}
   }
 
+  try {
+    document.documentElement.removeAttribute("data-vmux-hint-precount");
+  } catch (e) {}
+
   var sel =
-    'a[href],button,input:not([type="hidden"]):not([type="file"]),textarea,select,[role="button"],[role="link"],[contenteditable=""],[contenteditable="true"],[tabindex]:not([tabindex="-1"])';
-  var all = Array.prototype.slice.call(document.querySelectorAll(sel));
-  var nodes = [];
-  for (var i = 0; i < all.length; i++) {
-    var el = all[i];
-    if (el.disabled) continue;
-    var r = el.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) continue;
-    if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) continue;
-    var st = window.getComputedStyle(el);
-    if (st.visibility === "hidden" || st.display === "none") continue;
-    nodes.push(el);
+    'a[href],button,input:not([type="hidden"]):not([type="file"]),textarea,select,[role="button"],[role="link"],[role="menuitem"],[role="switch"],[contenteditable=""],[contenteditable="true"],[tabindex]:not([tabindex="-1"]),summary' +
+    ",#L2AGLb,#introAgreeButton,button[data-testid],a[data-testid],[data-testid^=\"uc-\"]";
+
+  /** Open shadow roots — keep logic aligned with link_hints_precount.js. */
+  function queryHintElementsDeep(root) {
+    var acc = [];
+    function walk(r) {
+      if (!r || !r.querySelectorAll) return;
+      var list = r.querySelectorAll(sel);
+      for (var i = 0; i < list.length; i++) acc.push(list[i]);
+      var star = r.querySelectorAll("*");
+      for (var j = 0; j < star.length; j++) {
+        var el = star[j];
+        if (el.shadowRoot) walk(el.shadowRoot);
+      }
+    }
+    walk(root);
+    return acc;
   }
+
+  function viewportSize() {
+    var vh =
+      typeof innerHeight === "number" && innerHeight > 0
+        ? innerHeight
+        : document.documentElement && document.documentElement.clientHeight
+          ? document.documentElement.clientHeight
+          : 0;
+    var vw =
+      typeof innerWidth === "number" && innerWidth > 0
+        ? innerWidth
+        : document.documentElement && document.documentElement.clientWidth
+          ? document.documentElement.clientWidth
+          : 0;
+    if (vh < 1) vh = 800;
+    if (vw < 1) vw = 1200;
+    return { vh: vh, vw: vw };
+  }
+
+  function buildNodes(all, strictViewport) {
+    var out = [];
+    var vs = viewportSize();
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (el.disabled) continue;
+      var r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      if (strictViewport) {
+        if (r.bottom < 0 || r.top > vs.vh || r.right < 0 || r.left > vs.vw) continue;
+      }
+      var st = window.getComputedStyle(el);
+      if (st.visibility === "hidden" || st.display === "none") continue;
+      if (st.opacity === "0") continue;
+      out.push(el);
+    }
+    return out;
+  }
+
+  var all = queryHintElementsDeep(document.documentElement);
+  var nodes = buildNodes(all, true);
+  if (nodes.length === 0 && all.length > 0) {
+    nodes = buildNodes(all, false);
+  }
+
+  var hintHost = document.body || document.documentElement;
   var HINT_BASE = 26;
   var HINT_CAP_1 = HINT_BASE;
   var HINT_CAP_2 = HINT_BASE * HINT_BASE;
@@ -63,11 +120,11 @@
 
   var labels = [];
   for (var li = 0; li < nodes.length; li++) {
-    labels.push(hintLabel(li, nodes.length));
+    labels.push(hintLabel(labelStart + li, labelTotal));
   }
 
   try {
-    var w = hintWidth(nodes.length);
+    var w = hintWidth(labelTotal);
     document.documentElement.setAttribute("data-vmux-hints", String(w));
   } catch (e) {}
 
@@ -78,7 +135,7 @@
     ".vmux-hint-muted{color:#777;font-weight:normal;}";
   style.textContent +=
     ".vmux-hint-nomatch{background:#e8dc8f!important;border-color:#888!important;color:#555!important;font-weight:normal!important;opacity:0.72!important;box-shadow:none;}";
-  document.documentElement.appendChild(style);
+  hintHost.appendChild(style);
 
   var removers = [];
   removers.push(function () {
@@ -94,7 +151,7 @@
     var r = el.getBoundingClientRect();
     sp.style.left = Math.max(0, r.left) + "px";
     sp.style.top = Math.max(0, r.top) + "px";
-    document.documentElement.appendChild(sp);
+    hintHost.appendChild(sp);
     spans.push(sp);
     removers.push(
       (function (node) {
@@ -108,6 +165,9 @@
   function doCleanup() {
     try {
       document.documentElement.removeAttribute("data-vmux-hints");
+    } catch (e) {}
+    try {
+      document.documentElement.removeAttribute("data-vmux-hint-precount");
     } catch (e) {}
     for (var k = removers.length - 1; k >= 0; k--) {
       try {
@@ -253,4 +313,4 @@
   }
   window.__vmux_hints_feed = feedKey;
   window.__vmux_hints_cleanup = doCleanup;
-})();
+})(__VMUX_LABEL_START__, __VMUX_LABEL_TOTAL__);
