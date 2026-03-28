@@ -1,0 +1,41 @@
+---
+description: vmux — prefer ECS systems/components; NonSend only for CEF-bound handles
+globs: examples/vmux/**/*.rs
+alwaysApply: false
+---
+
+# vmux: ECS-first shell, CEF in NonSend
+
+## Goal
+
+Put **application logic** in Bevy **systems** (and **components** / **events** where it fits). Use **`NonSend` / `NonSendMut` resources** only for types that are **not `Send`** or are **CEF / winit-adjacent** in a way that must stay on one thread with the CEF client.
+
+## Backend vs renderer (`browser`)
+
+- **`browser::backend`** — CEF lifecycle (`backend::cef`: bootstrap, pump, client, runtime, threads) and **OSR** (`backend::osr`: `CefHub`, `CefAttach`, `CefRenderHandler`). Use the **`::cef::`** crate for CEF APIs; vmux’s `backend::cef` is the integration layer.
+- **`browser::renderer`** — Presentation: **wgpu** surfaces (`renderer::gpu::device`, `color`, shader), **winit shells** (`renderer::shell`), and **input** (`renderer::input`). The compositor hub and paint handler are **not** under `renderer::gpu`; they live in `backend::osr`.
+
+## What belongs where
+
+- **`NonSendResource` (`ShellState`)** — CEF-facing handles only, e.g. `Rc<RefCell<Option<cef::Client>>>`, `CefAttach` (windows store + shell wiring), `EditableFocusQueues`, `BrowserUiOpQueue`. Anything that must be touched from the same place as `browser_host_*` / pump integration.
+- **Send `Resource`** — cross-thread–safe app state: `SettingsResource`, `ActiveBrowserId`, `GpuResource` / hub / device scale, queue resources built on `Arc<Mutex<…>>` if they remain as queues, and (target) **`RuntimeState`** once lifted out of `ShellState`.
+- **ECS** — per-browser **`Entity`** + `BrowserId` / `BrowserWindowId`; **`Query`** to resolve window → browser; **Bevy `Event`s** in [`events.rs`](examples/vmux/src/browser/events.rs) for deferred CEF work; **systems** to apply side effects.
+
+## `RuntimeState`
+
+[`RuntimeState`](examples/vmux/src/browser/event_loop.rs) in `event_loop` is a **single flat** `Resource`: modifiers/cursor/wheel, lifecycle fields (`started`, `quit_requested`, macOS refocus, `cef_post_create_pumps_remaining`), and pending queues (`pending_browser_hosts`, `pending_find_mode_keys`) — **not** nested sub-resources. Per-browser data belongs on ECS entities (`BrowserId`, etc.). Registered via `WinitPlugin::init_resource`. The winit runner uses `event_loop::with_shell_runtime_and_vimium` for `ShellState` + `RuntimeState` without overlapping `World` borrows.
+
+## Anti-patterns
+
+- Duplicating “which browsers exist” in **`BrowserHandler::browser_list`** and ECS — prefer ECS as the **identity** index and CEF/UI-thread maps for **`Browser` handles** only (see existing roadmap comments on UI thread).
+- Growing **`ShellState`** methods for behavior that does not touch CEF — **extract** to systems + `ResMut`/`Query`.
+
+## References
+
+- `examples/vmux/src/browser/backend/` — `cef` + `osr` (hub, render handler).
+- `examples/vmux/src/browser/renderer/` — wgpu device/color, shell, input.
+- `examples/vmux/src/browser/events.rs` — Bevy `Event`s and `Update` systems for deferred CEF/browser work.
+- `examples/vmux/src/browser/shell_ops.rs` — `BrowserUiOp` queue + `apply_browser_ui_ops_system` (editable-focus / URL map mutations on ECS entities).
+- `examples/vmux/src/browser/event_loop.rs` — winit runner, `WinitPlugin`, `Update` systems order.
+- `examples/vmux/src/browser/browser_entity.rs` — browser entities.
+- `.cursor/rules/cef-vmux-and-osr-roadmap.mdc` — CEF threading and shutdown.

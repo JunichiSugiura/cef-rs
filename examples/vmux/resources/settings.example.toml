@@ -1,7 +1,14 @@
 # Copy to `settings.toml` in the working directory, next to the app binary, or
-# `~/.config/vmux/settings.toml`. See `shared/settings.rs` for defaults.
+# `~/.config/vmux/settings.toml`.
 
-[vim]
+[browser]
+# Max DOM ancestor hops when probing whether the focused context allows typing (editable / text entry).
+dom_focus_ancestor_walk_max = 64
+# First window loads this URL on startup. Omit or use "" for the built-in default (Google; vmux loads
+# `about:blank` first then navigates here for http(s) URLs).
+startup_url = "https://www.google.com"
+
+[vimium]
 enabled = true
 # Milliseconds between two `g` presses for scroll-to-top (`gg`).
 scroll_top_double_press_ms = 500

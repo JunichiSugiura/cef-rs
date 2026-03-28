@@ -13,7 +13,11 @@ name = "vmux"
 name = "vmux_helper"
 
 [features]
-default = ["sandbox", "accelerated_osr"]
+# Chromium sandbox is opt-in: with default CEF + bundle layout it aborts early on macOS (e.g. fontations
+# in the browser process under sandbox). Enable with `--features sandbox` when your app entitlements
+# / helper layout match Chromium's expectations.
+# Software OSR (`on_paint`) by default for broader macOS stability; use `--features accelerated_osr` for shared-texture OSR.
+default = []
 sandbox = ["cef/sandbox"]
 accelerated_osr = ["cef/accelerated_osr"]
 linux-x11 = ["x11-dl"]
@@ -21,15 +25,25 @@ linux-x11 = ["x11-dl"]
 [package.metadata.cef.bundle]
 helper_name = "vmux_helper"
 resources_path = "resources"
+# Omit NSMainNibFile and NSPrincipalClass in the bundle plist: avoid AppKit init before Rust main.
+# Cmd+Q: winit window path (window/dispatch.rs). Dock Quit: terminate on VmuxApplication.
 
 [dependencies]
+bevy_app = { version = "0.15", default-features = false }
+bevy_ecs = { version = "0.15", default-features = false }
+bevy_log = { version = "0.15", default-features = false }
 cef = { workspace = true, features = ["build-util"] }
 wgpu.workspace = true
 winit = { version = "0.30" }
 pollster = "0.4"
+tokio = { version = "1", features = ["sync"] }
 bytemuck = "1"
 serde = { workspace = true, features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+bevy_render = { version = "0.15", default-features = false }
+bevy_tasks = { version = "0.15", default-features = false }
+# bevy_render 0.15 uses wgpu 23; used only to build a minimal `RenderContext` for `bevy_render::render_graph::Node` execution. OSR composite uses workspace wgpu 28 (`SharedGpu`).
+wgpu_bevy = { package = "wgpu", version = "23" }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

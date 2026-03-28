@@ -1,0 +1,5 @@
+# Shipped in the macOS bundle as `Contents/Resources/settings.toml` (see `bundle-cef-app`).
+# Ensures `open -n …/vmux.app` loads Google without env vars (staged `about:blank` still applies for https).
+
+[browser]
+startup_url = "https://www.google.com"
