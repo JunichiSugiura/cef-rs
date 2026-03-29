@@ -1,4 +1,4 @@
-//! Load optional `settings.toml` for Vimium-style key bindings (see `resources/settings.example.toml`).
+//! Load optional `settings.toml` for Vimium-style key bindings (see `resources/settings.default.toml`).
 //!
 //! Override the first-window URL with **`VMUX_STARTUP_URL`** (non-empty) when `open` is not passing env
 //! — run `…/vmux.app/Contents/MacOS/vmux` from a shell with that variable set.
@@ -10,7 +10,7 @@ pub const DEFAULT_DOM_FOCUS_ANCESTOR_WALK_MAX: usize = 64;
 ///
 /// `http`/`https` values load directly (no leading `about:blank` in history). If this is empty,
 /// vmux loads `about:blank` then the built-in default (see
-/// [`OsrHostState::staged_initial_navigation_url`](crate::browser::renderer::OsrHostState::staged_initial_navigation_url)).
+/// [`OsrHostState::staged_initial_navigation_url`](crate::browser::cef::shell::OsrHostState::staged_initial_navigation_url)).
 ///
 /// Default matches pass criteria (`open` does not pass env). Staged startup still loads
 /// Direct load for `https`/`http` startup URLs (see `OsrHostState::staged_initial_navigation_url`).
@@ -31,6 +31,100 @@ use winit::keyboard::KeyCode;
 pub struct SettingsFile {
     pub vimium: VimiumSettingsFile,
     pub browser: BrowserSettingsFile,
+    pub window_manager: WindowManagerSettingsFile,
+}
+
+/// Tiling / stack window manager (`[window_manager]` in `settings.toml`).
+///
+/// Tmux-style prefix and global WM chords live under `[window_manager.tmux]` and
+/// `[window_manager.tmux.keybindings]` (see [`WindowManagerTmuxFile`]).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WindowManagerSettingsFile {
+    /// Default `tmux` (same as `manual`, BSP + split keys) or `dynamic` (auto dwindle).
+    pub mode: String,
+    /// Initial geometry: `tile` or `stack`.
+    pub layout: String,
+    /// Optional override: `bsp`, `dwindle`, or `grid`. Empty = derive from `mode`.
+    pub tile_strategy: String,
+    /// When true, dwindle recomputes equal splits on resize (handled in layout pass).
+    pub balance_on_resize: bool,
+    /// Default split axis for manual pending splits: `horizontal` or `vertical`.
+    pub default_split_axis: String,
+    #[serde(default)]
+    pub tmux: WindowManagerTmuxFile,
+}
+
+impl Default for WindowManagerSettingsFile {
+    fn default() -> Self {
+        Self {
+            mode: "tmux".to_string(),
+            layout: "tile".to_string(),
+            tile_strategy: String::new(),
+            balance_on_resize: true,
+            default_split_axis: "vertical".to_string(),
+            tmux: WindowManagerTmuxFile::default(),
+        }
+    }
+}
+
+/// Tmux-aligned options and key chords (`[window_manager.tmux]` / `.keybindings`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WindowManagerTmuxFile {
+    /// Matches tmux option `prefix` (vmux chord string, e.g. `ctrl+b`). Empty or `none` disables leader.
+    pub prefix: String,
+    /// Milliseconds to press the command key after prefix (vmux-specific; not tmux `repeat-time`).
+    pub prefix_timeout_ms: u64,
+    #[serde(default)]
+    pub keybindings: WindowManagerTmuxKeybindingsFile,
+}
+
+impl Default for WindowManagerTmuxFile {
+    fn default() -> Self {
+        Self {
+            prefix: "ctrl+b".to_string(),
+            prefix_timeout_ms: 2000,
+            keybindings: WindowManagerTmuxKeybindingsFile::default(),
+        }
+    }
+}
+
+/// Global WM chords using hyphenated names that mirror tmux commands (`[window_manager.tmux.keybindings]`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WindowManagerTmuxKeybindingsFile {
+    #[serde(rename = "new-window")]
+    pub new_window: String,
+    #[serde(rename = "next-layout")]
+    pub next_layout: String,
+    #[serde(rename = "select-pane-next")]
+    pub select_pane_next: String,
+    #[serde(rename = "select-pane-previous")]
+    pub select_pane_previous: String,
+    #[serde(rename = "split-window-v")]
+    pub split_window_v: String,
+    #[serde(rename = "split-window-h")]
+    pub split_window_h: String,
+    #[serde(rename = "balance-panes")]
+    pub balance_panes: String,
+    #[serde(rename = "rotate-window")]
+    pub rotate_window: String,
+}
+
+impl Default for WindowManagerTmuxKeybindingsFile {
+    fn default() -> Self {
+        Self {
+            new_window: "cmd+n".to_string(),
+            next_layout: "cmd+shift+t".to_string(),
+            select_pane_next: "cmd+shift+bracketright".to_string(),
+            select_pane_previous: "cmd+shift+bracketleft".to_string(),
+            split_window_v: "cmd+ctrl+v".to_string(),
+            split_window_h: "cmd+ctrl+s".to_string(),
+            balance_panes: "cmd+ctrl+b".to_string(),
+            rotate_window: "cmd+ctrl+r".to_string(),
+        }
+    }
 }
 
 /// General browser / DOM tuning (not key bindings).
@@ -67,6 +161,8 @@ pub struct VimiumSettingsFile {
     pub scroll_bottom: String,
     pub history_back: String,
     pub history_forward: String,
+    /// Letter-only reload (default **`shift+r`** / `R`). Use **Cmd+R** (macOS) or **Ctrl+R**
+    /// elsewhere for Chrome-style reload (handled in `window::dispatch`, not here).
     pub reload: String,
     /// Link hints chord (default `f`). While hints are visible, the same key is fed to the page
     /// (hint letter), not a toggle — use Escape to cancel. Empty / `none` disables.
@@ -96,7 +192,7 @@ impl Default for VimiumSettingsFile {
             scroll_bottom: "shift+g".to_string(),
             history_back: "shift+h".to_string(),
             history_forward: "shift+l".to_string(),
-            reload: "r".to_string(),
+            reload: "shift+r".to_string(),
             hint_links: "f".to_string(),
             mode_insert: "i".to_string(),
             mode_find_open: "/".to_string(),
@@ -113,8 +209,43 @@ impl Default for SettingsFile {
         Self {
             vimium: VimiumSettingsFile::default(),
             browser: BrowserSettingsFile::default(),
+            window_manager: WindowManagerSettingsFile::default(),
         }
     }
+}
+
+/// High-level WM behavior from `[window_manager].mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WmMode {
+    #[default]
+    Dynamic,
+    Manual,
+}
+
+/// Tile (non-overlapping) vs stack (same rect, focused on top).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WmGeometryLayout {
+    #[default]
+    Tile,
+    Stack,
+}
+
+impl WmGeometryLayout {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Tile => Self::Stack,
+            Self::Stack => Self::Tile,
+        }
+    }
+}
+
+/// Effective tiling algorithm when `layout = tile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WmTileStrategy {
+    #[default]
+    Dwindle,
+    Bsp,
+    Grid,
 }
 
 /// Parsed modifier + physical key (US layout–agnostic via `PhysicalKey` in winit).
@@ -141,10 +272,20 @@ impl KeyChord {
             | F::EVENTFLAG_ALT_DOWN.0
             | F::EVENTFLAG_COMMAND_DOWN.0;
         let actual = mods.0 & mask;
-        let expected = (if self.shift { F::EVENTFLAG_SHIFT_DOWN.0 } else { 0 })
-            | (if self.ctrl { F::EVENTFLAG_CONTROL_DOWN.0 } else { 0 })
-            | (if self.alt { F::EVENTFLAG_ALT_DOWN.0 } else { 0 })
-            | (if self.cmd { F::EVENTFLAG_COMMAND_DOWN.0 } else { 0 });
+        let expected = (if self.shift {
+            F::EVENTFLAG_SHIFT_DOWN.0
+        } else {
+            0
+        }) | (if self.ctrl {
+            F::EVENTFLAG_CONTROL_DOWN.0
+        } else {
+            0
+        }) | (if self.alt { F::EVENTFLAG_ALT_DOWN.0 } else { 0 })
+            | (if self.cmd {
+                F::EVENTFLAG_COMMAND_DOWN.0
+            } else {
+                0
+            });
         actual == expected
     }
 }
@@ -175,16 +316,55 @@ pub struct KeySettings {
     pub find_next: Option<KeyChord>,
     pub find_prev: Option<KeyChord>,
     pub yank_url: Option<KeyChord>,
+    // --- window manager ([window_manager] / [window_manager.tmux].keybindings) ---
+    pub wm_mode: WmMode,
+    pub wm_initial_geometry_layout: WmGeometryLayout,
+    pub wm_tile_strategy_override: Option<WmTileStrategy>,
+    pub wm_balance_on_resize: bool,
+    pub wm_default_split_axis_vertical: bool,
+    pub wm_new_window: Option<KeyChord>,
+    pub wm_toggle_layout: Option<KeyChord>,
+    pub wm_focus_next: Option<KeyChord>,
+    pub wm_focus_prev: Option<KeyChord>,
+    pub wm_split_side_by_side: Option<KeyChord>,
+    pub wm_split_stacked: Option<KeyChord>,
+    pub wm_balance_windows: Option<KeyChord>,
+    pub wm_rotate_split: Option<KeyChord>,
+    /// Tmux-style leader (`ctrl+b`); `None` disables `"` / `%` / `c` / … sequences.
+    pub wm_tmux_prefix: Option<KeyChord>,
+    pub wm_tmux_prefix_timeout_ms: u64,
+}
+
+impl KeySettings {
+    /// Resolved tiling strategy: override, or `bsp` for manual / `dwindle` for dynamic.
+    #[inline]
+    pub fn effective_tile_strategy(&self) -> WmTileStrategy {
+        if let Some(s) = self.wm_tile_strategy_override {
+            return s;
+        }
+        match self.wm_mode {
+            WmMode::Manual => WmTileStrategy::Bsp,
+            WmMode::Dynamic => WmTileStrategy::Dwindle,
+        }
+    }
 }
 
 #[derive(Resource, Clone)]
 pub struct SettingsResource(pub Arc<KeySettings>);
 
 /// Bevy [`Startup`] set: `load_settings_resource_system` runs here. Other plugins should schedule
-/// work that needs [`SettingsResource`] **after** this set (e.g. [`crate::browser::backend::cef::CefPlugin`]).
+/// work that needs [`SettingsResource`] **before** later `Startup` systems (e.g. [`crate::browser::cef::CefPlugin`]).
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct VmuxSettingsStartup;
 
+/// Loads `settings.toml` on [`Startup`] and inserts [`SettingsResource`].
+///
+/// Same ordering idea as Bevy’s [`PreferencesPlugin`] in [`bevy_settings`]: load user settings
+/// early and treat [`SettingsResource`] as the source of truth for anything that runs after
+/// [`VmuxSettingsStartup`] (e.g. `.after(VmuxSettingsStartup)`).
+///
+/// [`PreferencesPlugin`]: https://github.com/bevyengine/bevy/blob/main/crates/bevy_settings/src/lib.rs
+/// [`bevy_settings`]: https://github.com/bevyengine/bevy/tree/main/crates/bevy_settings
 pub struct SettingsPlugin;
 
 impl Plugin for SettingsPlugin {
@@ -199,13 +379,78 @@ impl Plugin for SettingsPlugin {
 
 fn load_settings_resource_system(mut commands: bevy_ecs::system::Commands) {
     let file = load_settings_file();
-    commands.insert_resource(SettingsResource(Arc::new(key_settings_from_file(
-        &file,
-    ))));
+    commands.insert_resource(SettingsResource(Arc::new(key_settings_from_file(&file))));
+}
+
+fn parse_wm_mode(s: &str) -> WmMode {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "manual" | "tmux" => WmMode::Manual,
+        "dynamic" => WmMode::Dynamic,
+        other => {
+            eprintln!("vmux settings: unknown [window_manager] mode {other:?}, using dynamic");
+            WmMode::Dynamic
+        }
+    }
+}
+
+fn parse_wm_geometry_layout(s: &str) -> WmGeometryLayout {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "tile" => WmGeometryLayout::Tile,
+        "stack" => WmGeometryLayout::Stack,
+        other => {
+            eprintln!("vmux settings: unknown [window_manager] layout {other:?}, using tile");
+            WmGeometryLayout::Tile
+        }
+    }
+}
+
+fn parse_wm_tile_strategy(s: &str) -> Option<WmTileStrategy> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    Some(match t.to_ascii_lowercase().as_str() {
+        "bsp" => WmTileStrategy::Bsp,
+        "dwindle" => WmTileStrategy::Dwindle,
+        "grid" => WmTileStrategy::Grid,
+        other => {
+            eprintln!("vmux settings: unknown [window_manager] tile_strategy {other:?}, ignoring");
+            return None;
+        }
+    })
+}
+
+fn parse_wm_default_split_axis_vertical(s: &str) -> bool {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "vertical" | "v" => true,
+        "horizontal" | "h" => false,
+        other => {
+            eprintln!(
+                "vmux settings: unknown [window_manager] default_split_axis {other:?}, using vertical"
+            );
+            true
+        }
+    }
 }
 
 fn key_settings_from_file(file: &SettingsFile) -> KeySettings {
     let v = &file.vimium;
+    let wm = &file.window_manager;
+    let wm_mode = parse_wm_mode(&wm.mode);
+    let wm_initial_geometry_layout = parse_wm_geometry_layout(&wm.layout);
+    let mut wm_tile_strategy_override = parse_wm_tile_strategy(&wm.tile_strategy);
+    if wm_mode == WmMode::Manual && wm_tile_strategy_override == Some(WmTileStrategy::Dwindle) {
+        eprintln!(
+            "vmux settings: [window_manager] mode=manual with tile_strategy=dwindle is inconsistent; ignoring override"
+        );
+        wm_tile_strategy_override = None;
+    }
+    if wm_mode == WmMode::Dynamic && wm_tile_strategy_override == Some(WmTileStrategy::Bsp) {
+        eprintln!(
+            "vmux settings: [window_manager] mode=dynamic with tile_strategy=bsp is inconsistent; ignoring override"
+        );
+        wm_tile_strategy_override = None;
+    }
     let startup_url = {
         let u = file.browser.startup_url.trim();
         let mut url = if u.is_empty() {
@@ -223,10 +468,7 @@ fn key_settings_from_file(file: &SettingsFile) -> KeySettings {
     };
     KeySettings {
         enabled: v.enabled,
-        dom_focus_ancestor_walk_max: file
-            .browser
-            .dom_focus_ancestor_walk_max
-            .clamp(1, 512),
+        dom_focus_ancestor_walk_max: file.browser.dom_focus_ancestor_walk_max.clamp(1, 512),
         startup_url,
         scroll_top_double_press_ms: v.scroll_top_double_press_ms.max(50),
         scroll_line_down: parse_chord_opt(&v.scroll_line_down),
@@ -245,7 +487,32 @@ fn key_settings_from_file(file: &SettingsFile) -> KeySettings {
         find_next: parse_chord_opt(&v.find_next),
         find_prev: parse_chord_opt(&v.find_prev),
         yank_url: parse_chord_opt(&v.yank_url),
+        wm_mode,
+        wm_initial_geometry_layout,
+        wm_tile_strategy_override,
+        wm_balance_on_resize: wm.balance_on_resize,
+        wm_default_split_axis_vertical: parse_wm_default_split_axis_vertical(
+            &wm.default_split_axis,
+        ),
+        wm_new_window: parse_chord_opt(&wm.tmux.keybindings.new_window),
+        wm_toggle_layout: parse_chord_opt(&wm.tmux.keybindings.next_layout),
+        wm_focus_next: parse_chord_opt(&wm.tmux.keybindings.select_pane_next),
+        wm_focus_prev: parse_chord_opt(&wm.tmux.keybindings.select_pane_previous),
+        wm_split_side_by_side: parse_chord_opt(&wm.tmux.keybindings.split_window_v),
+        wm_split_stacked: parse_chord_opt(&wm.tmux.keybindings.split_window_h),
+        wm_balance_windows: parse_chord_opt(&wm.tmux.keybindings.balance_panes),
+        wm_rotate_split: parse_chord_opt(&wm.tmux.keybindings.rotate_window),
+        wm_tmux_prefix: parse_chord_opt(&wm.tmux.prefix),
+        wm_tmux_prefix_timeout_ms: wm.tmux.prefix_timeout_ms.clamp(100, 60_000),
     }
+}
+
+/// Test-only: build [`KeySettings`] from defaults with `[window_manager].mode` overridden.
+#[cfg(test)]
+pub(crate) fn key_settings_for_test_window_mode(mode: &str) -> KeySettings {
+    let mut file = SettingsFile::default();
+    file.window_manager.mode = mode.to_string();
+    key_settings_from_file(&file)
 }
 
 fn parse_chord_opt(s: &str) -> Option<KeyChord> {
@@ -267,7 +534,11 @@ fn parse_key_chord(s: &str) -> Result<KeyChord, String> {
     let mut ctrl = false;
     let mut alt = false;
     let mut cmd = false;
-    let parts: Vec<&str> = s.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&str> = s
+        .split('+')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.is_empty() {
         return Err("empty chord".into());
     }
@@ -346,6 +617,7 @@ fn parse_key_code(name: &str) -> Result<KeyCode, String> {
         "pageup" => KeyCode::PageUp,
         "pagedown" => KeyCode::PageDown,
         "slash" | "/" => KeyCode::Slash,
+        "quote" | "\"" => KeyCode::Quote,
         _ => return Err(format!("unknown key {name:?}")),
     };
     Ok(code)
@@ -388,11 +660,7 @@ fn winit_single_char_from_text_or_logical(
         winit::keyboard::Key::Character(s) => {
             let mut it = s.chars();
             let c = it.next()?;
-            if it.next().is_none() {
-                Some(c)
-            } else {
-                None
-            }
+            if it.next().is_none() { Some(c) } else { None }
         }
         _ => None,
     }
@@ -411,6 +679,28 @@ pub fn chord_matches_winit_or_text(
     if chord_matches_winit(chord, mods, physical) {
         return true;
     }
+
+    // Chords with no modifiers in settings (`f`, `j`, `/`, …): accept the committed character even
+    // when `shift` disagrees (Caps Lock / platform quirks) or `physical` is Unidentified — the
+    // strict block below would return false before reading `text`/`logical_key`. Do not treat
+    // intentional `Shift`+letter as an unmodified chord unless the typed character is lowercase.
+    if !chord.shift && !chord.ctrl && !chord.alt && !chord.cmd {
+        if !mods.control_key() && !mods.alt_key() && !mods.super_key() {
+            if let Some(c0) = winit_single_char_from_text_or_logical(text, logical_key) {
+                let shift_ok_for_plain = !mods.shift_key() || c0.is_ascii_lowercase();
+                if shift_ok_for_plain
+                    && chord_matches_winit_ime_char(
+                        chord,
+                        winit::keyboard::ModifiersState::default(),
+                        c0,
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
     if chord.shift != mods.shift_key()
         || chord.ctrl != mods.control_key()
         || chord.alt != mods.alt_key()
@@ -527,6 +817,9 @@ fn settings_search_paths() -> Vec<PathBuf> {
 }
 
 /// Fallback when [`SettingsResource`] is missing (e.g. ordering); matches `SettingsFile::default()` parsing.
+///
+/// Only [`crate::browser::cef`] uses this (`pub(crate)` because Rust `pub(in path)` requires `path`
+/// to be an ancestor module of `settings`, which it is not).
 pub(crate) fn default_key_settings() -> Arc<KeySettings> {
     Arc::new(key_settings_from_file(&SettingsFile::default()))
 }
@@ -560,67 +853,374 @@ fn load_settings_file() -> SettingsFile {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+use bevy_ecs::prelude::{Res, World};
+#[cfg(test)]
+use bevy_ecs::system::RunSystemOnce;
+#[cfg(test)]
+use winit::keyboard::{Key, ModifiersState, NativeKeyCode, PhysicalKey};
 
-    #[test]
-    fn parse_shift_g() {
-        let c = parse_key_chord("shift+g").unwrap();
-        assert!(c.shift);
-        assert_eq!(c.key, KeyCode::KeyG);
-    }
+#[cfg(test)]
+#[derive(Resource)]
+struct TomlCommentsOnlyIn(&'static str);
 
-    #[test]
-    fn parse_j() {
-        let c = parse_key_chord("j").unwrap();
-        assert!(!c.shift);
-        assert_eq!(c.key, KeyCode::KeyJ);
-    }
+#[cfg(test)]
+fn parse_comments_only_asserts_system(case: Res<TomlCommentsOnlyIn>) {
+    let file: SettingsFile = toml::from_str(case.0).expect("comments-only settings");
+    assert_eq!(file.browser.startup_url, DEFAULT_STARTUP_URL);
+    assert_eq!(
+        file.browser.dom_focus_ancestor_walk_max,
+        DEFAULT_DOM_FOCUS_ANCESTOR_WALK_MAX
+    );
+}
 
-    #[test]
-    fn ime_char_matches_hint_f_without_keyboard_event() {
-        let chord = parse_key_chord("f").unwrap();
-        let mods = winit::keyboard::ModifiersState::default();
-        assert!(chord_matches_winit_ime_char(&chord, mods, 'f'));
-        assert!(chord_matches_winit_ime_char(&chord, mods, 'F'));
-        assert!(!chord_matches_winit_ime_char(&chord, mods, 'g'));
-    }
+#[cfg(test)]
+#[test]
+fn parse_comments_only_settings_toml_uses_defaults_via_system() {
+    let mut world = World::default();
+    world.insert_resource(TomlCommentsOnlyIn("# stub — no keys\n"));
+    world
+        .run_system_once(parse_comments_only_asserts_system)
+        .unwrap();
+}
 
-    #[test]
-    fn chord_or_text_matches_f_when_physical_unidentified() {
-        use winit::keyboard::{Key, ModifiersState, NativeKeyCode, PhysicalKey};
-        let chord = parse_key_chord("f").unwrap();
-        let mods = ModifiersState::default();
-        let phys = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
-        let logical = Key::Character("f".into());
-        assert!(chord_matches_winit_or_text(
-            &chord,
-            mods,
-            &phys,
-            Some("f"),
-            &logical
-        ));
-        assert!(chord_matches_winit_or_text(
-            &chord,
-            mods,
-            &phys,
-            None,
-            &logical
-        ));
-    }
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseParseShiftG;
 
-    #[test]
-    fn ime_char_matches_default_vimium_scroll_and_modes() {
-        let mods = winit::keyboard::ModifiersState::default();
-        let j = parse_key_chord("j").unwrap();
-        assert!(chord_matches_winit_ime_char(&j, mods, 'j'));
+#[cfg(test)]
+fn parse_shift_g_system(_: Res<CaseParseShiftG>) {
+    let c = parse_key_chord("shift+g").unwrap();
+    assert!(c.shift);
+    assert_eq!(c.key, KeyCode::KeyG);
+}
 
-        let slash = parse_key_chord("/").unwrap();
-        assert!(chord_matches_winit_ime_char(&slash, mods, '/'));
+#[cfg(test)]
+#[test]
+fn parse_shift_g_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseParseShiftG);
+    world.run_system_once(parse_shift_g_system).unwrap();
+}
 
-        let mut shift = winit::keyboard::ModifiersState::default();
-        shift.set(winit::keyboard::ModifiersState::SHIFT, true);
-        let shift_n = parse_key_chord("shift+n").unwrap();
-        assert!(chord_matches_winit_ime_char(&shift_n, shift, 'N'));
-    }
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseParseShiftR;
+
+#[cfg(test)]
+fn parse_shift_r_system(_: Res<CaseParseShiftR>) {
+    let c = parse_key_chord("shift+r").unwrap();
+    assert!(c.shift);
+    assert_eq!(c.key, KeyCode::KeyR);
+}
+
+#[cfg(test)]
+#[test]
+fn parse_shift_r_default_vimium_reload_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseParseShiftR);
+    world.run_system_once(parse_shift_r_system).unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseParseJ;
+
+#[cfg(test)]
+fn parse_j_system(_: Res<CaseParseJ>) {
+    let c = parse_key_chord("j").unwrap();
+    assert!(!c.shift);
+    assert_eq!(c.key, KeyCode::KeyJ);
+}
+
+#[cfg(test)]
+#[test]
+fn parse_j_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseParseJ);
+    world.run_system_once(parse_j_system).unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseParseWmToggle;
+
+#[cfg(test)]
+fn parse_wm_toggle_layout_chord_system(_: Res<CaseParseWmToggle>) {
+    let c = parse_key_chord("cmd+shift+t").unwrap();
+    assert!(c.cmd);
+    assert!(c.shift);
+    assert_eq!(c.key, KeyCode::KeyT);
+}
+
+#[cfg(test)]
+#[test]
+fn parse_wm_toggle_layout_chord_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseParseWmToggle);
+    world
+        .run_system_once(parse_wm_toggle_layout_chord_system)
+        .unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseParseTmuxLeader;
+
+#[cfg(test)]
+fn parse_tmux_leader_ctrl_b_system(_: Res<CaseParseTmuxLeader>) {
+    let c = parse_key_chord("ctrl+b").unwrap();
+    assert!(c.ctrl);
+    assert!(!c.cmd);
+    assert_eq!(c.key, KeyCode::KeyB);
+}
+
+#[cfg(test)]
+#[test]
+fn parse_tmux_leader_ctrl_b_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseParseTmuxLeader);
+    world
+        .run_system_once(parse_tmux_leader_ctrl_b_system)
+        .unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseParseQuote;
+
+#[cfg(test)]
+fn parse_quote_key_name_system(_: Res<CaseParseQuote>) {
+    let c = parse_key_chord("shift+quote").unwrap();
+    assert!(c.shift);
+    assert_eq!(c.key, KeyCode::Quote);
+}
+
+#[cfg(test)]
+#[test]
+fn parse_quote_key_name_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseParseQuote);
+    world.run_system_once(parse_quote_key_name_system).unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseParseWmFocusBrackets;
+
+#[cfg(test)]
+fn parse_wm_focus_brackets_system(_: Res<CaseParseWmFocusBrackets>) {
+    let n = parse_key_chord("cmd+shift+bracketright").unwrap();
+    assert!(n.cmd && n.shift);
+    assert_eq!(n.key, KeyCode::BracketRight);
+    let p = parse_key_chord("cmd+shift+bracketleft").unwrap();
+    assert_eq!(p.key, KeyCode::BracketLeft);
+}
+
+#[cfg(test)]
+#[test]
+fn parse_wm_focus_brackets_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseParseWmFocusBrackets);
+    world
+        .run_system_once(parse_wm_focus_brackets_system)
+        .unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseDeserializeNestedTmux;
+
+#[cfg(test)]
+fn deserialize_nested_window_manager_tmux_keybindings_system(_: Res<CaseDeserializeNestedTmux>) {
+    let toml_str = r#"
+[window_manager]
+mode = "tmux"
+layout = "tile"
+tile_strategy = ""
+balance_on_resize = true
+default_split_axis = "vertical"
+
+[window_manager.tmux]
+prefix = "ctrl+b"
+prefix_timeout_ms = 1500
+
+[window_manager.tmux.keybindings]
+new-window = "cmd+n"
+next-layout = "cmd+shift+t"
+select-pane-next = "cmd+shift+bracketright"
+select-pane-previous = "cmd+shift+bracketleft"
+split-window-v = "cmd+ctrl+v"
+split-window-h = "cmd+ctrl+s"
+balance-panes = "cmd+ctrl+b"
+rotate-window = "cmd+ctrl+r"
+"#;
+    let file: SettingsFile = toml::from_str(toml_str).expect("parse nested window_manager.tmux");
+    let ks = key_settings_from_file(&file);
+    assert_eq!(ks.wm_tmux_prefix_timeout_ms, 1500);
+    let prefix = ks.wm_tmux_prefix.as_ref().expect("prefix");
+    assert!(prefix.ctrl);
+    assert_eq!(prefix.key, KeyCode::KeyB);
+    let nw = ks.wm_new_window.as_ref().expect("new-window");
+    assert!(nw.cmd);
+    assert_eq!(nw.key, KeyCode::KeyN);
+    let tl = ks.wm_toggle_layout.as_ref().expect("next-layout");
+    assert!(tl.cmd && tl.shift);
+    assert_eq!(tl.key, KeyCode::KeyT);
+    assert!(ks.wm_focus_next.is_some() && ks.wm_focus_prev.is_some());
+    assert!(ks.wm_split_side_by_side.is_some() && ks.wm_split_stacked.is_some());
+    assert!(ks.wm_balance_windows.is_some() && ks.wm_rotate_split.is_some());
+}
+
+#[cfg(test)]
+#[test]
+fn deserialize_nested_window_manager_tmux_keybindings_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseDeserializeNestedTmux);
+    world
+        .run_system_once(deserialize_nested_window_manager_tmux_keybindings_system)
+        .unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseImeCharHintF;
+
+#[cfg(test)]
+fn ime_char_matches_hint_f_system(_: Res<CaseImeCharHintF>) {
+    let chord = parse_key_chord("f").unwrap();
+    let mods = ModifiersState::default();
+    assert!(chord_matches_winit_ime_char(&chord, mods, 'f'));
+    assert!(chord_matches_winit_ime_char(&chord, mods, 'F'));
+    assert!(!chord_matches_winit_ime_char(&chord, mods, 'g'));
+}
+
+#[cfg(test)]
+#[test]
+fn ime_char_matches_hint_f_without_keyboard_event_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseImeCharHintF);
+    world
+        .run_system_once(ime_char_matches_hint_f_system)
+        .unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseChordOrTextUnidentified;
+
+#[cfg(test)]
+fn chord_or_text_matches_f_unidentified_system(_: Res<CaseChordOrTextUnidentified>) {
+    let chord = parse_key_chord("f").unwrap();
+    let mods = ModifiersState::default();
+    let phys = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+    let logical = Key::Character("f".into());
+    assert!(chord_matches_winit_or_text(
+        &chord,
+        mods,
+        &phys,
+        Some("f"),
+        &logical
+    ));
+    assert!(chord_matches_winit_or_text(
+        &chord, mods, &phys, None, &logical
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn chord_or_text_matches_f_when_physical_unidentified_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseChordOrTextUnidentified);
+    world
+        .run_system_once(chord_or_text_matches_f_unidentified_system)
+        .unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseChordOrTextShiftSpurious;
+
+#[cfg(test)]
+fn chord_or_text_plain_f_shift_spurious_system(_: Res<CaseChordOrTextShiftSpurious>) {
+    let chord = parse_key_chord("f").unwrap();
+    let mut mods = ModifiersState::default();
+    mods.set(ModifiersState::SHIFT, true);
+    let phys = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+    let logical = Key::Character("f".into());
+    assert!(chord_matches_winit_or_text(
+        &chord,
+        mods,
+        &phys,
+        Some("f"),
+        &logical
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn chord_or_text_matches_plain_f_when_shift_spurious_with_unidentified_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseChordOrTextShiftSpurious);
+    world
+        .run_system_once(chord_or_text_plain_f_shift_spurious_system)
+        .unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseChordOrTextUppercaseF;
+
+#[cfg(test)]
+fn chord_or_text_no_match_uppercase_f_system(_: Res<CaseChordOrTextUppercaseF>) {
+    let chord = parse_key_chord("f").unwrap();
+    let mut mods = ModifiersState::default();
+    mods.set(ModifiersState::SHIFT, true);
+    let phys = PhysicalKey::Unidentified(NativeKeyCode::Unidentified);
+    let logical = Key::Character("F".into());
+    assert!(!chord_matches_winit_or_text(
+        &chord,
+        mods,
+        &phys,
+        Some("F"),
+        &logical
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn chord_or_text_does_not_match_shift_uppercase_f_as_plain_hint_chord_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseChordOrTextUppercaseF);
+    world
+        .run_system_once(chord_or_text_no_match_uppercase_f_system)
+        .unwrap();
+}
+
+#[cfg(test)]
+#[derive(Resource)]
+struct CaseImeVimiumScrollModes;
+
+#[cfg(test)]
+fn ime_char_vimium_scroll_modes_system(_: Res<CaseImeVimiumScrollModes>) {
+    let mods = ModifiersState::default();
+    let j = parse_key_chord("j").unwrap();
+    assert!(chord_matches_winit_ime_char(&j, mods, 'j'));
+
+    let slash = parse_key_chord("/").unwrap();
+    assert!(chord_matches_winit_ime_char(&slash, mods, '/'));
+
+    let mut shift = ModifiersState::default();
+    shift.set(ModifiersState::SHIFT, true);
+    let shift_n = parse_key_chord("shift+n").unwrap();
+    assert!(chord_matches_winit_ime_char(&shift_n, shift, 'N'));
+}
+
+#[cfg(test)]
+#[test]
+fn ime_char_matches_default_vimium_scroll_and_modes_via_system() {
+    let mut world = World::default();
+    world.insert_resource(CaseImeVimiumScrollModes);
+    world
+        .run_system_once(ime_char_vimium_scroll_modes_system)
+        .unwrap();
 }

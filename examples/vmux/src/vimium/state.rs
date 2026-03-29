@@ -30,7 +30,10 @@
 //! Pattern matching on `mode` stays in this module so transitions and predicates stay in one
 //! place.
 
+use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
+
+use bevy_ecs::prelude::Resource;
 
 /// How long a link-hint session stays armed after `f` (overlay may appear a frame later).
 pub const LINK_HINT_TTL: Duration = Duration::from_secs(120);
@@ -129,7 +132,9 @@ impl VimiumState {
     fn in_any_ux(&self) -> bool {
         matches!(
             &self.mode,
-            VimiumInputMode::Insert { .. } | VimiumInputMode::Find { .. } | VimiumInputMode::Visual { .. }
+            VimiumInputMode::Insert { .. }
+                | VimiumInputMode::Find { .. }
+                | VimiumInputMode::Visual { .. }
         )
     }
 
@@ -283,4 +288,43 @@ impl VimiumState {
             self.find_committed.clear();
         }
     }
+}
+
+/// Live vimium mode machine — separate from [`crate::runtime::RuntimeState`] (modifiers, pending shells, …).
+#[derive(Resource)]
+pub struct VimiumStateResource(pub VimiumState);
+
+impl Default for VimiumStateResource {
+    fn default() -> Self {
+        Self(VimiumState::default())
+    }
+}
+
+pub struct VimiumSession {
+    vimium: VimiumState,
+}
+
+impl VimiumSession {
+    pub fn new(vimium: VimiumState) -> Self {
+        Self { vimium }
+    }
+}
+
+impl Deref for VimiumSession {
+    type Target = VimiumState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vimium
+    }
+}
+
+impl DerefMut for VimiumSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.vimium
+    }
+}
+
+#[derive(Resource, Debug, Clone, Default)]
+pub struct VimiumRuntimeResource {
+    pub snapshot: VimiumStateSnapshot,
 }

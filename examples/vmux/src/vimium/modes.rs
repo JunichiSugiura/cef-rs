@@ -2,9 +2,12 @@
 
 use cef::{Browser, CefString, ImplBrowser as _, ImplBrowserHost as _, ImplFrame as _};
 
-const FIND_UI_BOOTSTRAP: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/find_ui.js"));
-const VISUAL_HINT_BOOTSTRAP: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/visual_hint.js"));
+const FIND_UI_BOOTSTRAP: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/find_ui.js"));
+const VISUAL_HINT_BOOTSTRAP: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/visual_hint.js"
+));
 
 fn escape_js_single_quoted(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 8);
@@ -67,12 +70,7 @@ pub fn cef_find(browser: &Browser, query: &str, forward: bool, find_next: bool) 
         return;
     };
     let s = CefString::from(query);
-    host.find(
-        Some(&s),
-        forward as i32,
-        0,
-        find_next as i32,
-    );
+    host.find(Some(&s), forward as i32, 0, find_next as i32);
 }
 
 pub fn cef_stop_finding(browser: &Browser, clear_selection: bool) {

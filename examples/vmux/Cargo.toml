@@ -4,7 +4,7 @@ edition = "2024"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "vmux"
@@ -20,7 +20,6 @@ name = "vmux_helper"
 default = []
 sandbox = ["cef/sandbox"]
 accelerated_osr = ["cef/accelerated_osr"]
-linux-x11 = ["x11-dl"]
 
 [package.metadata.cef.bundle]
 helper_name = "vmux_helper"
@@ -45,10 +44,8 @@ bevy_tasks = { version = "0.15", default-features = false }
 # bevy_render 0.15 uses wgpu 23; used only to build a minimal `RenderContext` for `bevy_render::render_graph::Node` execution. OSR composite uses workspace wgpu 28 (`SharedGpu`).
 wgpu_bevy = { package = "wgpu", version = "23" }
 
-[target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
-
 [target.'cfg(target_os = "macos")'.dependencies]
+signal-hook = "0.3"
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit = { workspace = true, features = [
@@ -61,15 +58,3 @@ objc2-app-kit = { workspace = true, features = [
     "NSWindow",
     "objc2-core-foundation",
 ] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-] }
-
-[target.'cfg(target_os = "windows")'.build-dependencies]
-winres.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-x11-dl = { workspace = true, optional = true }

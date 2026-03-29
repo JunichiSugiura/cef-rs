@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 
-use bevy_app::{App, Plugin, Update};
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::system::{Commands, Query, ResMut, Resource};
@@ -30,28 +29,19 @@ pub struct WindowComponent {
 }
 
 #[derive(Resource, Default)]
-struct WindowRegistryState {
+pub(crate) struct WindowRegistryState {
     entities_by_window: HashMap<WindowId, Entity>,
 }
 
-pub struct WindowRegistryPlugin;
-
-impl Plugin for WindowRegistryPlugin {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<WindowRegistryState>()
-            .add_systems(Update, sync_window_components_with_cef);
-    }
-}
-
-fn sync_window_components_with_cef(
+pub(crate) fn sync_window_components_with_cef(
     mut commands: Commands,
     mut state: ResMut<WindowRegistryState>,
     mut window_components: Query<&mut WindowComponent>,
 ) {
-    let Some(idx) = crate::browser::event_loop::try_foreign_osr_index() else {
+    let Some(idx) = crate::runtime::try_ffi_osr_index() else {
         return;
     };
-    let pairs = crate::browser::backend::osr::foreign_index::browser_window_pairs(idx.as_ref());
+    let pairs = crate::browser::cef::osr::browser_window_pairs(idx.as_ref());
     let mut seen = HashSet::new();
 
     for (browser_id, window_id) in pairs {

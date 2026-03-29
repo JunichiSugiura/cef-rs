@@ -18,8 +18,9 @@ If a full red step is impractical (e.g. heavy harness), still add the test **bef
 ## What to test
 
 - **Regressions**: Prefer a test that would have caught the break (wiring, scheduling, gating flags), not only a happy-path smoke test.
-- **Pure logic**: Unit-test helpers and predicates in isolation (`#[cfg(test)] mod tests` in the same file is fine).
-- **Plugins / composition**: Where full `App` setup is cheap enough, assert critical plugins or resources are registered (e.g. `app.is_plugin_added::<…>()` in Bevy).
+- **`examples/vmux` (Bevy / ECS)**: Prefer **system-level** tests — minimal `World` / `App`, seed resources/components/events, run production or `#[cfg(test)]` systems via `run_system_once` (or `app.update()` when locals / change detection matter), assert world state. See [.cursor/rules/vmux-ecs-system-tdd.mdc](vmux-ecs-system-tdd.mdc). **Plugin-only** checks are supplementary, not a substitute for behavior coverage.
+- **Pure logic (non-vmux or extracted helpers)**: Unit-test helpers and predicates in isolation (`#[cfg(test)] mod tests` in the same file is fine).
+- **Plugins / composition**: Where full `App` setup is cheap enough, assert critical plugins or resources are registered (e.g. `app.is_plugin_added::<…>()` in Bevy); for vmux, treat this as **composition smoke** alongside system-level tests.
 
 ## Running tests (this repo)
 

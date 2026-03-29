@@ -7,8 +7,8 @@ alwaysApply: true
 
 ## vmux (`examples/vmux`) — OSR + winit + wgpu
 
-- **vmux** uses **off-screen rendering (OSR)**: **`Settings.windowless_rendering_enabled`**, **`external_message_pump`**, **`RenderHandler`**, **`browser_host_create_browser_sync`**, composited with **winit** + **wgpu** under `examples/vmux/src/shared/vmux_osr/`.
-- **Tabs / windows**: each browser can map to a winit window; shortcuts (e.g. primary modifier + **N**) open another window + browser. Demo URLs: `vmux_osr/demo_pages.rs`.
+- **vmux** uses **off-screen rendering (OSR)**: **`Settings.windowless_rendering_enabled`**, **`external_message_pump`**, **`RenderHandler`**, **`browser_host_create_browser_sync`**, composited with **winit** + **wgpu** under **`examples/vmux/src/browser/cef/`** (e.g. **`cef::osr`**, **`cef::renderer`**, **`cef::stage`**).
+- **Tabs / windows**: each browser can map to a winit window; shortcuts (e.g. primary modifier + **N**) open another window + browser. Demo URLs and startup pages are wired from settings / CEF stage code in the same tree (see **`cef::stage`**, **`cef::app`**).
 - **Do not** change **`examples/osr`** for vmux work; use it as a **read-only** reference (pump loop, `do_message_loop_work`, optional `accelerated_osr`).
 
 ## macOS — build and launch vmux (required for CEF framework path)
@@ -31,8 +31,8 @@ Helper bundling is configured in **`examples/vmux/Cargo.toml`** via **`[package.
 ## macOS — quit and shutdown
 
 - **Quit menu** (`MainMenu.xib`): `terminate:` must target **`-2` (NSApplication / File’s Owner)**, not **`-1` (First Responder)`** — otherwise Chromium’s key view can handle quit and only the focused window closes.
-- **`VmuxHandler::close_all_browsers`**: take `&Arc<Mutex<Self>>`, **clone `browser_list` under a short lock, release lock**, then call `close_browser` on each. **Never** hold the handler mutex across `close_browser` — CEF can call `do_close` synchronously and **deadlocks** re-locking the same mutex.
-- **`applicationShouldTerminate`**: return **`TerminateCancel`** where applicable; with **external message pump** + winit, teardown is also coordinated via **`vmux_osr::shutdown`** and **`cef::shutdown()`** after the last browser / loop exit.
+- **Close all browsers**: mirror the mutex discipline from legacy handlers — **clone browser IDs / handles under a short lock, release lock**, then call `close_browser` on each. **Never** hold the same mutex across `close_browser` when CEF can call `do_close` synchronously and **deadlock** re-locking. In vmux today this path lives in **`browser::cef::closeall`** and related lifecycle resources (see **`browser::system`** + **`cef::lifecycle`**).
+- **`applicationShouldTerminate`**: return **`TerminateCancel`** where applicable; with **external message pump** + winit, teardown is coordinated via **`runtime`** user events (**`AppEvent::ShutdownRequested`**), the winit runner / **`ShutdownFlag`**, and **`cef::shutdown()`** after the last browser / loop exit.
 
 ## Future stack (Bevy + custom UI)
 
@@ -41,11 +41,11 @@ Helper bundling is configured in **`examples/vmux/Cargo.toml`** via **`[package.
 
 ## References in repo
 
-- `examples/vmux/src/shared/vmux_osr/` — GPU hub, bootstrap, winit `ApplicationHandler`, render handler.
-- `examples/vmux/src/shared/vmux_app.rs` — CEF `App` + `on_context_initialized` → OSR bootstrap.
-- `examples/vmux/src/shared/vmux_handler/mod.rs` — browser list, `close_all_browsers`, lifecycle, client + `render_handler`.
-- `examples/vmux/src/shared/mod.rs` — `run_main` (external pump + winit).
-- `examples/vmux/src/mac/mod.rs` — `VmuxApplication`, delegate, menu/quit wiring.
+- `examples/vmux/src/browser/cef/` — CEF integration: **`cef::osr`** (OSR hub / render handler), **`cef::renderer`** (wgpu composite), **`cef::stage`** (winit / pump), **`cef::shell`**, **`cef::client`**, **`cef::app`**, **`cef::macos`**, etc.
+- `examples/vmux/src/runtime/` — winit runner, **`RuntimeState`**, user events, FFI bridges to OSR / pump.
+- `examples/vmux/src/main.rs` — browser-process entry: **`cef::execute_process`**, **`cef::initialize`**, Bevy + custom winit runner.
+- `examples/vmux/src/browser/system.rs` + `examples/vmux/src/browser/system/` — Bevy systems that apply browser events and CEF UI-thread work.
+- **`browser::cef::macos`** + **`examples/vmux/resources/mac/`** — AppKit **`VmuxApplication`**, delegate, menu/quit wiring, bundled **`MainMenu.xib`**.
 - `examples/vmux/resources/mac/English.lproj/MainMenu.xib` — Quit target **`-2`**.
 - `README.md` — **`bundle-cef-app`** usage (also documents **`cefsimple`**).
 - `examples/osr/` — reference-only OSR + winit + wgpu (do not modify for vmux migration).
